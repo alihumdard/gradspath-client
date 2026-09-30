@@ -1,0 +1,113 @@
+<?php
+
+namespace Modules\Bookings\app\Jobs;
+
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Facades\Mail;
+use Modules\Bookings\app\Mail\BookingReminderMail;
+use Modules\Bookings\app\Models\Booking;
+use Modules\Bookings\app\Services\BookingMeetingPresenter;
+
+class SendBookingReminderJob implements ShouldQueue
+{
+    use Queueable;
+
+    public function __construct(
+        public int $bookingId,
+        public int $hoursUntilSession,
+    ) {}
+
+    public function handle(BookingMeetingPresenter $meetingPresenter): void
+    {
+        $booking = Booking::query()
+            ->with(['booker', 'mentor.user', 'service', 'participantRecords', 'officeHourSession'])
+            ->find($this->bookingId);
+
+        if (! $booking || $booking->status !== 'confirmed') {
+            return;
+        }
+
+        $baseDetails = [
+            'booking_id' => $booking->id,
+            'service_name' => $booking->service?->service_name ?? 'Service',
+            'session_type_label' => match ($booking->session_type) {
+                'office_hours' => 'Office Hours',
+                '1on3' => '1 on 3',
+                '1on5' => '1 on 5',
+                default => '1 on 1',
+            },
+            'session_date' => $booking->sessionAtInTimezone()?->format('l, F j, Y') ?? 'TBD',
+            'session_time' => $booking->sessionAtInTimezone()?->format('g:i A') ?? 'TBD',
+            'session_timezone' => $booking->session_timezone,
+            'meeting_link' => $booking->meeting_link,
+            'meeting_provider' => $meetingPresenter->providerLabel($booking),
+            'meeting_link_label' => $meetingPresenter->linkLabel($booking),
+            'mentor_name' => $booking->mentor?->user?->name ?? 'Mentor',
+            'booker_name' => $booking->booker?->name ?? 'Booker',
+            'hours_until_session' => $this->hoursUntilSession,
+        ];
+
+        $recipients = collect([
+            [
+                'email' => $booking->mentor?->user?->email,
+                'name' => $booking->mentor?->user?->name ?: 'Mentor',
+                'role' => 'mentor',
+            ],
+        ])->merge(
+            $booking->participantRecords->map(fn ($participant) => [
+                'email' => $participant->email,
+                'name' => $participant->full_name ?: 'Participant',
+                'role' => 'participant',
+                'user_id' => $participant->user_id,
+                'is_primary' => (bool) $participant->is_primary,
+            ])
+        )
+            ->map(fn (array $recipient) => [
+                'email' => $this->normalizeEmail($recipient['email'] ?? null),
+                'name' => $recipient['name'] ?? 'Participant',
+                'role' => $recipient['role'] ?? 'participant',
+                'user_id' => $recipient['user_id'] ?? null,
+                'is_primary' => (bool) ($recipient['is_primary'] ?? false),
+            ])
+            ->filter(fn (array $recipient) => $recipient['email'] !== null)
+            ->unique('email')
+            ->values();
+
+        foreach ($recipients as $recipient) {
+            $details = $baseDetails;
+
+            if (($recipient['role'] ?? null) === 'mentor' && $this->isSyncedZoomBooking($booking)) {
+                $details['meeting_link'] = route('mentor.bookings.start-meeting', $booking->id);
+                $details['meeting_link_label'] = 'Start Zoom Meeting';
+            } elseif (
+                $this->isSyncedZoomBooking($booking)
+                && (($recipient['user_id'] ?? null) || ($recipient['is_primary'] ?? false))
+            ) {
+                $details['meeting_link'] = route('student.bookings.join-meeting', $booking->id);
+                $details['meeting_link_label'] = 'Join Zoom Meeting';
+            }
+
+            Mail::to($recipient['email'])->send(new BookingReminderMail(
+                $details,
+                $recipient['name'],
+                $recipient['role'],
+                $this->hoursUntilSession,
+            ));
+        }
+    }
+
+    private function normalizeEmail(?string $email): ?string
+    {
+        $normalized = strtolower(trim((string) $email));
+
+        return $normalized === '' ? null : $normalized;
+    }
+
+    private function isSyncedZoomBooking(Booking $booking): bool
+    {
+        return $booking->calendar_provider === 'zoom'
+            && $booking->calendar_sync_status === 'synced'
+            && filled($booking->external_calendar_event_id);
+    }
+}

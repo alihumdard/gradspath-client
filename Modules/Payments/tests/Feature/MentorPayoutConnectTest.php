@@ -1,0 +1,412 @@
+<?php
+
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Client\Factory as HttpFactory;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Str;
+use Modules\Auth\app\Models\User;
+use Modules\Bookings\app\Models\Booking;
+use Modules\Payments\app\Jobs\ProcessMentorPayoutJob;
+use Modules\Payments\app\Jobs\ProcessStripeWebhookJob;
+use Modules\Payments\app\Jobs\QueueMentorPayoutsJob;
+use Modules\Payments\app\Models\MentorPayout;
+use Modules\Payments\app\Models\ServiceConfig;
+use Modules\Payments\app\Models\StripeWebhook;
+use Modules\Payments\app\Services\StripeWebhookService;
+use Modules\Settings\app\Models\Mentor;
+use Spatie\Permission\Models\Role;
+use Spatie\Permission\PermissionRegistrar;
+use Tests\TestCase;
+
+uses(TestCase::class, RefreshDatabase::class);
+
+beforeEach(function () {
+    app(PermissionRegistrar::class)->forgetCachedPermissions();
+    Role::findOrCreate('mentor', 'web');
+    config()->set('services.stripe.secret_key', 'sk_test_fake');
+    config()->set('services.stripe.api_base', 'https://api.stripe.com/v1');
+});
+
+function createMentorUserForPayouts(): User
+{
+    $user = User::factory()->create([
+        'email' => Str::uuid().'@example.com',
+        'is_active' => true,
+    ]);
+
+    $user->assignRole('mentor');
+
+    return $user;
+}
+
+function stripeWebhookSignatureForPayouts(string $payload, string $secret): string
+{
+    $timestamp = time();
+    $signature = hash_hmac('sha256', $timestamp.'.'.$payload, $secret);
+
+    return "t={$timestamp},v1={$signature}";
+}
+
+it('creates a connected account and redirects mentors to Stripe onboarding', function () {
+    Http::fake([
+        'https://api.stripe.com/v1/accounts' => Http::response([
+            'id' => 'acct_new_123',
+        ], 200),
+        'https://api.stripe.com/v1/account_links' => Http::response([
+            'url' => 'https://connect.stripe.test/onboarding/acct_new_123',
+        ], 200),
+    ]);
+    $this->app->instance(HttpFactory::class, Http::getFacadeRoot());
+
+    $mentorUser = createMentorUserForPayouts();
+    Mentor::query()->create([
+        'user_id' => $mentorUser->id,
+        'mentor_type' => 'graduate',
+        'status' => 'active',
+    ]);
+
+    $response = $this->withoutMiddleware()
+        ->actingAs($mentorUser)
+        ->get(route('mentor.payouts.connect'));
+
+    $response->assertRedirect('https://connect.stripe.test/onboarding/acct_new_123');
+
+    expect($mentorUser->fresh()->mentor?->stripe_account_id)->toBe('acct_new_123');
+
+    Http::assertSent(function ($request) {
+        return $request->url() === 'https://api.stripe.com/v1/accounts'
+            && str_contains($request->body(), 'type=express')
+            && str_contains($request->body(), 'capabilities%5Btransfers%5D%5Brequested%5D=true');
+    });
+
+    Http::assertSent(function ($request) {
+        return $request->url() === 'https://api.stripe.com/v1/account_links'
+            && str_contains($request->body(), 'type=account_onboarding')
+            && str_contains($request->body(), 'collection_options%5Bfields%5D=eventually_due');
+    });
+});
+
+it('lets payout-enabled mentors open a hosted Stripe update flow', function () {
+    Http::fake([
+        'https://api.stripe.com/v1/account_links' => Http::response([
+            'url' => 'https://connect.stripe.test/update/acct_existing_123',
+        ], 200),
+    ]);
+    $this->app->instance(HttpFactory::class, Http::getFacadeRoot());
+
+    $mentorUser = createMentorUserForPayouts();
+    Mentor::query()->create([
+        'user_id' => $mentorUser->id,
+        'mentor_type' => 'graduate',
+        'status' => 'active',
+        'stripe_account_id' => 'acct_existing_123',
+        'stripe_onboarding_complete' => true,
+        'payouts_enabled' => true,
+    ]);
+
+    $response = $this->withoutMiddleware()
+        ->actingAs($mentorUser)
+        ->get(route('mentor.payouts.connect'));
+
+    $response->assertRedirect('https://connect.stripe.test/update/acct_existing_123');
+
+    Http::assertSent(function ($request) {
+        return $request->url() === 'https://api.stripe.com/v1/account_links'
+            && str_contains($request->body(), 'account=acct_existing_123')
+            && str_contains($request->body(), 'type=account_update');
+    });
+});
+
+it('replaces stale connected accounts and continues onboarding', function () {
+    Http::fake([
+        'https://api.stripe.com/v1/account_links' => Http::sequence()
+            ->push([
+                'error' => [
+                    'message' => 'You requested an account link for an account that is not connected to your platform.',
+                ],
+            ], 400)
+            ->push([
+                'url' => 'https://connect.stripe.test/onboarding/acct_recovered_123',
+            ], 200),
+        'https://api.stripe.com/v1/accounts' => Http::response([
+            'id' => 'acct_recovered_123',
+        ], 200),
+    ]);
+    $this->app->instance(HttpFactory::class, Http::getFacadeRoot());
+
+    $mentorUser = createMentorUserForPayouts();
+    Mentor::query()->create([
+        'user_id' => $mentorUser->id,
+        'mentor_type' => 'graduate',
+        'status' => 'active',
+        'stripe_account_id' => 'acct_stale_123',
+        'stripe_onboarding_complete' => false,
+        'payouts_enabled' => false,
+    ]);
+
+    $response = $this->withoutMiddleware()
+        ->actingAs($mentorUser)
+        ->get(route('mentor.payouts.connect'));
+
+    $response->assertRedirect('https://connect.stripe.test/onboarding/acct_recovered_123');
+
+    $mentor = $mentorUser->fresh()->mentor;
+
+    expect($mentor?->stripe_account_id)->toBe('acct_recovered_123');
+    expect($mentor?->stripe_onboarding_complete)->toBeFalse();
+    expect($mentor?->payouts_enabled)->toBeFalse();
+
+    Http::assertSent(function ($request) {
+        return $request->url() === 'https://api.stripe.com/v1/account_links'
+            && str_contains($request->body(), 'account=acct_stale_123');
+    });
+
+    Http::assertSent(function ($request) {
+        return $request->url() === 'https://api.stripe.com/v1/account_links'
+            && str_contains($request->body(), 'account=acct_recovered_123')
+            && str_contains($request->body(), 'type=account_onboarding');
+    });
+});
+
+it('marks mentor payouts as enabled when stripe sends account updates', function () {
+    $mentorUser = createMentorUserForPayouts();
+    $mentor = Mentor::query()->create([
+        'user_id' => $mentorUser->id,
+        'mentor_type' => 'graduate',
+        'status' => 'active',
+        'stripe_account_id' => 'acct_sync_123',
+        'stripe_onboarding_complete' => false,
+        'payouts_enabled' => false,
+    ]);
+
+    app(StripeWebhookService::class)->process([
+        'id' => 'evt_account_updated_123',
+        'type' => 'account.updated',
+        'data' => [
+            'object' => [
+                'id' => 'acct_sync_123',
+                'details_submitted' => true,
+                'payouts_enabled' => true,
+                'requirements' => [
+                    'currently_due' => [],
+                    'eventually_due' => [],
+                ],
+            ],
+        ],
+    ]);
+
+    expect($mentor->fresh()->payouts_enabled)->toBeTrue();
+    expect($mentor->fresh()->stripe_onboarding_complete)->toBeTrue();
+
+    $this->assertDatabaseHas('stripe_webhooks', [
+        'event_id' => 'evt_account_updated_123',
+        'event_type' => 'account.updated',
+        'processed' => true,
+    ]);
+});
+
+it('syncs mentor payout status when stripe sends an account link returned event', function () {
+    Http::fake([
+        'https://api.stripe.com/v1/accounts/acct_link_returned_123' => Http::response([
+            'id' => 'acct_link_returned_123',
+            'details_submitted' => true,
+            'payouts_enabled' => true,
+            'requirements' => [
+                'currently_due' => [],
+                'eventually_due' => [],
+            ],
+        ], 200),
+    ]);
+    $this->app->instance(HttpFactory::class, Http::getFacadeRoot());
+
+    $mentorUser = createMentorUserForPayouts();
+    $mentor = Mentor::query()->create([
+        'user_id' => $mentorUser->id,
+        'mentor_type' => 'graduate',
+        'status' => 'active',
+        'stripe_account_id' => 'acct_link_returned_123',
+        'stripe_onboarding_complete' => false,
+        'payouts_enabled' => false,
+    ]);
+
+    app(StripeWebhookService::class)->process([
+        'id' => 'evt_account_link_returned_123',
+        'type' => 'v2.core.account_link.returned',
+        'data' => [
+            'account_id' => 'acct_link_returned_123',
+            'configurations' => ['recipient', 'merchant'],
+            'use_case' => 'account_onboarding',
+        ],
+    ]);
+
+    expect($mentor->fresh()->payouts_enabled)->toBeTrue();
+    expect($mentor->fresh()->stripe_onboarding_complete)->toBeTrue();
+
+    $this->assertDatabaseHas('stripe_webhooks', [
+        'event_id' => 'evt_account_link_returned_123',
+        'event_type' => 'v2.core.account_link.returned',
+        'processed' => true,
+    ]);
+});
+
+it('accepts connect webhooks using the connect webhook secret', function () {
+    Queue::fake();
+
+    config()->set('services.stripe.webhook_secret', 'whsec_platform_test');
+    config()->set('services.stripe.connect_webhook_secret', 'whsec_connect_test');
+
+    $payload = json_encode([
+        'id' => 'evt_connect_route_123',
+        'type' => 'v2.core.account_link.returned',
+        'data' => [
+            'account_id' => 'acct_connect_route_123',
+        ],
+    ]);
+
+    $badResponse = $this->call(
+        'POST',
+        route('webhooks.stripe.connect'),
+        [],
+        [],
+        [],
+        [
+            'CONTENT_TYPE' => 'application/json',
+            'HTTP_STRIPE_SIGNATURE' => stripeWebhookSignatureForPayouts($payload, 'whsec_platform_test'),
+        ],
+        $payload
+    );
+
+    $badResponse->assertStatus(400);
+
+    $goodResponse = $this->call(
+        'POST',
+        route('webhooks.stripe.connect'),
+        [],
+        [],
+        [],
+        [
+            'CONTENT_TYPE' => 'application/json',
+            'HTTP_STRIPE_SIGNATURE' => stripeWebhookSignatureForPayouts($payload, 'whsec_connect_test'),
+        ],
+        $payload
+    );
+
+    $goodResponse->assertAccepted();
+
+    Queue::assertPushed(ProcessStripeWebhookJob::class, function (ProcessStripeWebhookJob $job) {
+        return $job->payload['id'] === 'evt_connect_route_123'
+            && $job->payload['type'] === 'v2.core.account_link.returned';
+    });
+});
+
+it('ignores unhandled stripe webhook events without storing payloads', function () {
+    app(StripeWebhookService::class)->process([
+        'id' => 'evt_capability_noise_123',
+        'type' => 'capability.updated',
+        'data' => [
+            'object' => [
+                'id' => 'transfers',
+                'status' => 'active',
+            ],
+        ],
+    ]);
+
+    $this->assertDatabaseMissing('stripe_webhooks', [
+        'event_id' => 'evt_capability_noise_123',
+    ]);
+});
+
+it('prunes old processed stripe webhook rows', function () {
+    StripeWebhook::query()->create([
+        'event_id' => 'evt_old_processed_123',
+        'event_type' => 'checkout.session.completed',
+        'payload' => ['id' => 'evt_old_processed_123'],
+        'processed' => true,
+        'received_at' => now()->subDays(91),
+        'processed_at' => now()->subDays(91),
+    ]);
+
+    StripeWebhook::query()->create([
+        'event_id' => 'evt_old_pending_123',
+        'event_type' => 'checkout.session.completed',
+        'payload' => ['id' => 'evt_old_pending_123'],
+        'processed' => false,
+        'received_at' => now()->subDays(91),
+    ]);
+
+    $this->artisan('stripe:prune-webhooks')
+        ->expectsOutput('Pruned Stripe webhooks: 1')
+        ->assertSuccessful();
+
+    $this->assertDatabaseMissing('stripe_webhooks', [
+        'event_id' => 'evt_old_processed_123',
+    ]);
+
+    $this->assertDatabaseHas('stripe_webhooks', [
+        'event_id' => 'evt_old_pending_123',
+    ]);
+});
+
+it('queues eligible mentor payouts for horizon processing', function () {
+    Queue::fake();
+
+    $mentorUser = createMentorUserForPayouts();
+    $mentor = Mentor::query()->create([
+        'user_id' => $mentorUser->id,
+        'mentor_type' => 'graduate',
+        'status' => 'active',
+        'stripe_account_id' => 'acct_ready_123',
+        'stripe_onboarding_complete' => true,
+        'payouts_enabled' => true,
+    ]);
+
+    $student = User::factory()->create([
+        'is_active' => true,
+    ]);
+
+    $service = ServiceConfig::query()->create([
+        'service_name' => 'Payout Test',
+        'service_slug' => 'payout-test-'.Str::uuid(),
+        'duration_minutes' => 60,
+        'is_active' => true,
+        'price_1on1' => 65,
+    ]);
+
+    $booking = Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'session_at' => now()->subHour(),
+        'session_timezone' => 'UTC',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'credits_charged' => 0,
+        'amount_charged' => 65,
+        'currency' => 'USD',
+        'status' => 'completed',
+        'approval_status' => 'not_required',
+        'completed_at' => now(),
+    ]);
+
+    $payout = MentorPayout::query()->create([
+        'mentor_id' => $mentor->id,
+        'booking_id' => $booking->id,
+        'student_id' => $student->id,
+        'stripe_account_id' => $mentor->stripe_account_id,
+        'amount' => 42,
+        'gross_amount' => 65,
+        'mentor_share_amount' => 42,
+        'platform_fee_amount' => 23,
+        'currency' => 'USD',
+        'status' => MentorPayout::STATUS_READY,
+        'eligible_at' => now(),
+    ]);
+
+    (new QueueMentorPayoutsJob)->handle();
+
+    Queue::assertPushed(ProcessMentorPayoutJob::class, function (ProcessMentorPayoutJob $job) use ($payout) {
+        return $job->payoutId === $payout->id;
+    });
+});

@@ -1,0 +1,83 @@
+<?php
+
+namespace Modules\Payments\app\Models;
+
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Modules\Bookings\app\Models\Booking;
+use Modules\Settings\app\Models\Mentor;
+
+class ServiceConfig extends Model
+{
+    protected $table = 'services_config';
+
+    public const OFFICE_HOURS_FOCUS_SERVICE_NAMES = [
+        'Tutoring',
+        'Program Insights',
+        'Interview Prep',
+    ];
+
+    protected $fillable = [
+        'service_name',
+        'service_slug',
+        'duration_minutes',
+        'is_active',
+        'price_1on1',
+        'platform_fee_1on1',
+        'mentor_payout_1on1',
+        'price_1on3_per_person',
+        'price_1on3_total',
+        'platform_fee_1on3',
+        'mentor_payout_1on3',
+        'price_1on5_per_person',
+        'price_1on5_total',
+        'platform_fee_1on5',
+        'mentor_payout_1on5',
+        'is_office_hours',
+        'office_hours_subscription_price',
+        'office_hours_mentor_payout_per_attendee',
+        'credit_cost_1on1',
+        'credit_cost_1on3',
+        'credit_cost_1on5',
+        'sort_order',
+    ];
+
+    protected $casts = [
+        'is_active' => 'boolean',
+        'is_office_hours' => 'boolean',
+        'price_1on1' => 'decimal:2',
+        'platform_fee_1on1' => 'decimal:2',
+        'mentor_payout_1on1' => 'decimal:2',
+        'price_1on3_per_person' => 'decimal:2',
+        'price_1on3_total' => 'decimal:2',
+        'platform_fee_1on3' => 'decimal:2',
+        'mentor_payout_1on3' => 'decimal:2',
+        'price_1on5_per_person' => 'decimal:2',
+        'price_1on5_total' => 'decimal:2',
+        'platform_fee_1on5' => 'decimal:2',
+        'mentor_payout_1on5' => 'decimal:2',
+        'office_hours_subscription_price' => 'decimal:2',
+        'office_hours_mentor_payout_per_attendee' => 'decimal:2',
+    ];
+
+    public function mentors(): BelongsToMany
+    {
+        return $this->belongsToMany(Mentor::class, 'mentor_services')
+            ->withPivot(['sort_order'])
+            ->withTimestamps();
+    }
+
+    public function bookings(): HasMany
+    {
+        return $this->hasMany(Booking::class);
+    }
+
+    public function scopeOfficeHoursFocusEligible(Builder $query): Builder
+    {
+        return $query
+            ->where('services_config.is_office_hours', false)
+            ->whereIn('services_config.service_name', self::OFFICE_HOURS_FOCUS_SERVICE_NAMES);
+    }
+}

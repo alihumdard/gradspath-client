@@ -1,0 +1,26 @@
+@extends('layouts.portal-student')
+
+@section('title', 'Support - Grads Paths')
+@section('portal_css_asset', 'assets/css/support.css')
+@section('portal_active_nav', 'support')
+
+@section('page_topbar_left')
+  <div class="search-wrap">
+    <input
+      type="text"
+      class="search-input"
+      placeholder="Search mentors, universities..."
+    />
+  </div>
+@endsection
+
+@section('portal_content')
+  @include('support::partials.form-content', [
+      'portalLabel' => 'Student Support',
+      'submitRoute' => route('student.support.store'),
+  ])
+@endsection
+
+@section('page_js')
+  <script src="{{ asset('assets/js/support.js') }}"></script>
+@endsection

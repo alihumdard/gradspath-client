@@ -1,0 +1,2822 @@
+<?php
+
+use Carbon\Carbon;
+use Illuminate\Foundation\Testing\DatabaseTransactions;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Str;
+use Modules\Auth\app\Models\OauthToken;
+use Modules\Auth\app\Models\User;
+use Modules\Bookings\app\Jobs\SendBookingConfirmationJob;
+use Modules\Bookings\app\Jobs\MarkCompletedBookingsJob;
+use Modules\Bookings\app\Jobs\SendBookingReminderJob;
+use Modules\Bookings\app\Mail\BookingCancelledNotificationMail;
+use Modules\Bookings\app\Mail\MentorBookingNotificationMail;
+use Modules\Bookings\app\Mail\StudentBookingConfirmationMail;
+use Modules\Bookings\app\Exceptions\BookingException;
+use Modules\Bookings\app\Models\Booking;
+use Modules\Bookings\app\Models\BookingMeetingEvent;
+use Modules\Bookings\app\Services\BookingPageService;
+use Modules\Bookings\app\Services\BookingService;
+use Modules\Bookings\app\Services\MarkCompletedBookingsService;
+use Modules\Bookings\app\Services\ZoomService;
+use Modules\Feedback\app\Models\MentorRating;
+use Modules\Feedback\app\Services\FeedbackService;
+use Modules\Payments\app\Models\ServiceConfig;
+use Modules\Payments\app\Models\UserCredit;
+use Modules\Settings\app\Models\Mentor;
+use Spatie\Permission\Models\Role;
+use Spatie\Permission\PermissionRegistrar;
+
+uses(DatabaseTransactions::class);
+
+beforeEach(function () {
+    app(PermissionRegistrar::class)->forgetCachedPermissions();
+
+    Role::findOrCreate('student', 'web');
+    Role::findOrCreate('mentor', 'web');
+    Role::findOrCreate('admin', 'web');
+
+    config([
+        'services.zoom.enabled' => true,
+        'services.zoom.client_id' => 'zoom-client-id',
+        'services.zoom.client_secret' => 'zoom-client-secret',
+        'services.zoom.redirect_uri' => 'https://gradspath.test/mentor/settings/zoom/callback',
+        'services.zoom.api_base' => 'https://api.zoom.us/v2',
+    ]);
+});
+
+function fakeZoomApi(string $meetingId = 'zoom-meeting-123', string $joinUrl = 'https://zoom.us/j/9876543210'): void
+{
+    Http::fake([
+        'https://api.zoom.us/v2/users/me/meetings' => Http::response([
+            'id' => $meetingId,
+            'join_url' => $joinUrl,
+        ], 200),
+        'https://api.zoom.us/v2/meetings/*' => Http::response([], 204),
+    ]);
+}
+
+function makeUser(string $emailPrefix): User
+{
+    return User::factory()->create([
+        'email' => $emailPrefix.'-'.Str::uuid().'@example.edu',
+        'is_active' => true,
+        'email_verified_at' => now(),
+    ]);
+}
+
+function makeService(array $overrides = []): ServiceConfig
+{
+    return ServiceConfig::query()->create(array_merge([
+        'service_name' => 'Tutoring',
+        'service_slug' => 'tutoring-'.Str::lower(Str::random(8)),
+        'duration_minutes' => 60,
+        'is_active' => true,
+        'price_1on1' => 70,
+        'platform_fee_1on1' => 27,
+        'mentor_payout_1on1' => 43,
+        'price_1on3_per_person' => 60,
+        'price_1on3_total' => 180,
+        'platform_fee_1on3' => 80,
+        'mentor_payout_1on3' => 100,
+        'price_1on5_per_person' => 50,
+        'price_1on5_total' => 250,
+        'platform_fee_1on5' => 110,
+        'mentor_payout_1on5' => 140,
+        'is_office_hours' => false,
+        'office_hours_mentor_payout_per_attendee' => null,
+        'credit_cost_1on1' => 1,
+        'credit_cost_1on3' => 1,
+        'credit_cost_1on5' => 1,
+        'sort_order' => 1,
+    ], $overrides));
+}
+
+function makeMentor(): Mentor
+{
+    $mentorUser = makeUser('mentor');
+    $mentorUser->assignRole('mentor');
+
+    OauthToken::query()->create([
+        'user_id' => $mentorUser->id,
+        'provider' => 'zoom',
+        'provider_user_id' => 'zoom-user-'.$mentorUser->id,
+        'access_token' => 'mentor-access-token-'.$mentorUser->id,
+        'refresh_token' => 'mentor-refresh-token-'.$mentorUser->id,
+        'token_expires_at' => now()->addHour(),
+    ]);
+
+    return Mentor::query()->create([
+        'user_id' => $mentorUser->id,
+        'mentor_type' => 'graduate',
+        'program_type' => 'mba',
+        'grad_school_display' => 'Harvard',
+        'status' => 'active',
+    ]);
+}
+
+function attachMentorService(Mentor $mentor, ServiceConfig $service): void
+{
+    DB::table('mentor_services')->insert([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'is_active' => true,
+        'sort_order' => 0,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+}
+
+function createAvailabilitySlot(Mentor $mentor, ServiceConfig $service, string $sessionType, int $daysAhead = 6): int
+{
+    return DB::table('mentor_availability_slots')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'slot_date' => now()->addDays($daysAhead)->toDateString(),
+        'start_time' => '13:00:00',
+        'end_time' => '14:00:00',
+        'timezone' => 'America/New_York',
+        'session_type' => $sessionType,
+        'max_participants' => match ($sessionType) {
+            '1on3' => 3,
+            '1on5' => 5,
+            default => 1,
+        },
+        'booked_participants_count' => 0,
+        'is_booked' => false,
+        'is_blocked' => false,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+}
+
+function fundStudent(User $student, int $balance = 5): void
+{
+    UserCredit::query()->create([
+        'user_id' => $student->id,
+        'balance' => $balance,
+    ]);
+}
+
+it('returns only real available slot months days and times', function () {
+    $student = makeUser('student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $service = makeService([
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+
+    DB::table('mentor_services')->insert([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'is_active' => true,
+        'sort_order' => 0,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $openSlotId = DB::table('mentor_availability_slots')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'slot_date' => now()->addDays(8)->toDateString(),
+        'start_time' => '10:00:00',
+        'end_time' => '11:00:00',
+        'timezone' => 'America/New_York',
+        'session_type' => '1on1',
+        'max_participants' => 1,
+        'booked_participants_count' => 0,
+        'is_booked' => false,
+        'is_blocked' => false,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $bookedSlotId = DB::table('mentor_availability_slots')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'slot_date' => now()->addDays(9)->toDateString(),
+        'start_time' => '15:00:00',
+        'end_time' => '16:00:00',
+        'timezone' => 'America/New_York',
+        'session_type' => '1on1',
+        'max_participants' => 1,
+        'booked_participants_count' => 1,
+        'is_booked' => true,
+        'is_blocked' => false,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'mentor_availability_slot_id' => $bookedSlotId,
+        'session_type' => '1on1',
+        'session_at' => now()->addDays(9)->setTime(15, 0),
+        'session_timezone' => 'America/New_York',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'credits_charged' => 1,
+        'amount_charged' => 70,
+        'currency' => 'USD',
+        'status' => 'confirmed',
+        'approval_status' => 'not_required',
+    ]);
+
+    $query = [
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+    ];
+
+    $months = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.months', $query))
+        ->assertOk()
+        ->json('months');
+
+    expect($months)->toHaveCount(1);
+
+    $month = $months[0]['month'];
+
+    $days = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.days', array_merge($query, ['month' => $month])))
+        ->assertOk()
+        ->json('days');
+
+    expect($days)->toHaveCount(1)
+        ->and($days[0]['date'])->toBe(now()->addDays(8)->toDateString());
+
+    $times = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.times', array_merge($query, [
+            'date' => now()->addDays(8)->toDateString(),
+        ])))
+        ->assertOk()
+        ->json('times');
+
+    expect($times)->toHaveCount(1)
+        ->and($times[0]['slotId'])->toBe($openSlotId);
+});
+
+it('renders booking availability in the viewer saved timezone', function () {
+    $student = makeUser('student-timezone-viewer');
+    $student->assignRole('student');
+    DB::table('user_settings')->insert([
+        'user_id' => $student->id,
+        'theme' => 'light',
+        'email_notifications' => true,
+        'sms_notifications' => false,
+        'timezone' => 'Asia/Karachi',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $mentor = makeMentor();
+    $service = makeService();
+    attachMentorService($mentor, $service);
+
+    $slotDate = now()->addDays(8)->toDateString();
+    DB::table('mentor_availability_slots')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'slot_date' => $slotDate,
+        'start_time' => '23:00:00',
+        'end_time' => '23:30:00',
+        'timezone' => 'America/New_York',
+        'session_type' => '1on1',
+        'max_participants' => 1,
+        'booked_participants_count' => 0,
+        'is_booked' => false,
+        'is_blocked' => false,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $query = [
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+    ];
+
+    $month = Carbon::parse($slotDate.' 23:00:00', 'America/New_York')->setTimezone('Asia/Karachi')->format('Y-m');
+    $viewerDate = Carbon::parse($slotDate.' 23:00:00', 'America/New_York')->setTimezone('Asia/Karachi')->toDateString();
+
+    $days = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.days', array_merge($query, ['month' => $month])))
+        ->assertOk()
+        ->json('days');
+
+    expect($days)->toHaveCount(1)
+        ->and($days[0]['date'])->toBe($viewerDate);
+
+    $times = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.times', array_merge($query, [
+            'date' => $viewerDate,
+        ])))
+        ->assertOk()
+        ->json('times');
+
+    expect($times)->toHaveCount(1)
+        ->and($times[0]['label'])->toBe('8:00 AM')
+        ->and($times[0]['timezone'])->toBe('Asia/Karachi');
+});
+
+it('uses utc slot instants for student timezone display and expiration', function () {
+    $student = makeUser('student-utc-slot-viewer');
+    $student->assignRole('student');
+    DB::table('user_settings')->insert([
+        'user_id' => $student->id,
+        'theme' => 'light',
+        'email_notifications' => true,
+        'sms_notifications' => false,
+        'timezone' => 'America/Los_Angeles',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $mentor = makeMentor();
+    $service = makeService();
+    attachMentorService($mentor, $service);
+
+    $futureStartUtc = now('UTC')->addDays(5)->setTime(22, 0, 0);
+    $futureEndUtc = $futureStartUtc->copy()->addMinutes(45);
+    $viewerStart = $futureStartUtc->copy()->setTimezone('America/Los_Angeles');
+
+    DB::table('mentor_availability_slots')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'slot_date' => now('UTC')->addYears(10)->toDateString(),
+        'start_time' => '01:00:00',
+        'end_time' => '02:00:00',
+        'timezone' => 'Asia/Karachi',
+        'starts_at_utc' => $futureStartUtc->toDateTimeString(),
+        'ends_at_utc' => $futureEndUtc->toDateTimeString(),
+        'session_type' => '1on1',
+        'max_participants' => 1,
+        'booked_participants_count' => 0,
+        'is_booked' => false,
+        'is_blocked' => false,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    DB::table('mentor_availability_slots')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'slot_date' => now('UTC')->addYears(10)->toDateString(),
+        'start_time' => '03:00:00',
+        'end_time' => '04:00:00',
+        'timezone' => 'Asia/Karachi',
+        'starts_at_utc' => now('UTC')->subMinute()->toDateTimeString(),
+        'ends_at_utc' => now('UTC')->addMinutes(44)->toDateTimeString(),
+        'session_type' => '1on1',
+        'max_participants' => 1,
+        'booked_participants_count' => 0,
+        'is_booked' => false,
+        'is_blocked' => false,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $query = [
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+    ];
+
+    $months = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.months', $query))
+        ->assertOk()
+        ->json('months');
+
+    expect($months)->toHaveCount(1)
+        ->and($months[0]['month'])->toBe($viewerStart->format('Y-m'));
+
+    $days = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.days', array_merge($query, [
+            'month' => $months[0]['month'],
+        ])))
+        ->assertOk()
+        ->json('days');
+
+    expect($days)->toHaveCount(1)
+        ->and($days[0]['date'])->toBe($viewerStart->toDateString());
+
+    $times = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.times', array_merge($query, [
+            'date' => $viewerStart->toDateString(),
+        ])))
+        ->assertOk()
+        ->json('times');
+
+    expect($times)->toHaveCount(1)
+        ->and($times[0]['label'])->toBe($viewerStart->format('g:i A'))
+        ->and($times[0]['timezone'])->toBe('America/Los_Angeles');
+});
+
+it('returns recurring office-hours availability as one date with session details', function () {
+    $student = makeUser('student-office-hours-availability');
+    $student->assignRole('student');
+    DB::table('user_settings')->insert([
+        'user_id' => $student->id,
+        'theme' => 'light',
+        'email_notifications' => true,
+        'sms_notifications' => false,
+        'timezone' => 'America/New_York',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office-hours-'.Str::lower(Str::random(8)),
+        'duration_minutes' => 45,
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $focusService = makeService([
+        'service_name' => 'Interview Prep',
+        'service_slug' => 'interview-prep-'.Str::lower(Str::random(8)),
+    ]);
+
+    DB::table('mentor_services')->insert([
+        [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $officeHoursService->id,
+            'is_active' => true,
+            'sort_order' => 0,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ],
+        [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $focusService->id,
+            'is_active' => true,
+            'sort_order' => 1,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ],
+    ]);
+
+    $sessionDate = now()->addDays(7)->toDateString();
+    $sessionMonth = Carbon::parse($sessionDate)->format('Y-m');
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $focusService->id,
+        'session_date' => $sessionDate,
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 2,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => true,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $query = [
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $officeHoursService->id,
+        'session_type' => 'office_hours',
+    ];
+
+    $months = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.months', $query))
+        ->assertOk()
+        ->json('months');
+
+    expect($months)->toHaveCount(1)
+        ->and($months[0]['month'])->toBe($sessionMonth);
+
+    $days = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.days', array_merge($query, ['month' => $sessionMonth])))
+        ->assertOk()
+        ->json('days');
+
+    expect($days)->toHaveCount(1)
+        ->and($days[0]['date'])->toBe($sessionDate)
+        ->and($days[0]['sessionId'])->toBe($sessionId)
+        ->and($days[0]['spotsFilled'])->toBe(2)
+        ->and($days[0]['maxSpots'])->toBe(3)
+        ->and($days[0]['isBookable'])->toBeTrue();
+
+    $times = $this->actingAs($student)
+        ->getJson(route('student.bookings.availability.times', array_merge($query, [
+            'date' => $sessionDate,
+        ])))
+        ->assertOk()
+        ->json('times');
+
+    expect($times)->toHaveCount(1)
+        ->and($times[0]['sessionId'])->toBe($sessionId)
+        ->and($times[0]['timeRangeLabel'])->toBe('5:00 PM to 5:45 PM')
+        ->and($times[0]['recurrenceLabel'])->toBe('This is a recurring weekly session')
+        ->and($times[0]['spotsFilled'])->toBe(2)
+        ->and($times[0]['availabilityText'])->toBe('1 spot remaining');
+});
+
+it('rejects office-hours bookings that try to use a normal focus service as the paid service', function () {
+    $student = makeUser('student-office-hours-normal-service');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office-hours-'.Str::lower(Str::random(5)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $focusService = makeService([
+        'service_name' => 'Interview Prep',
+        'service_slug' => 'interview-prep-'.Str::lower(Str::random(5)),
+    ]);
+
+    attachMentorService($mentor, $officeHoursService);
+    attachMentorService($mentor, $focusService);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $focusService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $focusService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 0,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $focusService->id,
+            'session_type' => 'office_hours',
+            'office_hour_session_id' => $sessionId,
+            'meeting_type' => 'zoom',
+        ])
+        ->assertSessionHasErrors(['service_config_id']);
+});
+
+it('rejects standard bookings that try to use the office-hours service', function () {
+    $student = makeUser('student-standard-office-hours-service');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office-hours-'.Str::lower(Str::random(5)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+
+    attachMentorService($mentor, $officeHoursService);
+    $slotId = createAvailabilitySlot($mentor, $officeHoursService, '1on1');
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $officeHoursService->id,
+            'session_type' => '1on1',
+            'mentor_availability_slot_id' => $slotId,
+            'meeting_type' => 'zoom',
+        ])
+        ->assertSessionHasErrors(['session_type']);
+});
+
+it('rejects office-hours bookings when the mentor has not enabled office hours', function () {
+    $student = makeUser('student-office-hours-disabled');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office-hours-'.Str::lower(Str::random(5)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $focusService = makeService(['service_name' => 'Interview Prep']);
+
+    attachMentorService($mentor, $officeHoursService);
+    attachMentorService($mentor, $focusService);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $focusService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '20:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => false,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $focusService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '20:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 0,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $officeHoursService->id,
+            'session_type' => 'office_hours',
+            'office_hour_session_id' => $sessionId,
+            'meeting_type' => 'zoom',
+        ])
+        ->assertSessionHasErrors(['booking', 'office_hour_session_id']);
+});
+
+it('falls back to a normal service when an office-hours link is opened for a mentor without the office-hours service', function () {
+    $student = makeUser('student-office-hours-link');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $focusService = makeService([
+        'service_name' => 'Interview Prep',
+        'service_slug' => 'interview-prep-'.Str::lower(Str::random(5)),
+    ]);
+
+    attachMentorService($mentor, $focusService);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $focusService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '20:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+    DB::table('office_hour_sessions')->insert([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $focusService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '20:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 0,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $data = app(BookingPageService::class)->buildBookingPageData($mentor->fresh('services'), $student, [
+        'portal' => 'student',
+        'allow_office_hours' => true,
+        'selected_service' => 'office_hours',
+    ]);
+
+    expect($data['officeHours'])->toBeNull()
+        ->and(collect($data['services'])->contains(fn (array $service) => (bool) $service['isOfficeHours']))->toBeFalse()
+        ->and($data['selectedServiceId'])->toBe($focusService->service_slug);
+});
+
+it('falls back to a normal service when an office-hours link is opened for a disabled mentor', function () {
+    $student = makeUser('student-office-hours-disabled-link');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $normalService = makeService([
+        'service_name' => 'Interview Prep',
+        'service_slug' => 'interview-prep-'.Str::lower(Str::random(5)),
+    ]);
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+
+    attachMentorService($mentor, $normalService);
+    attachMentorService($mentor, $officeHoursService);
+
+    DB::table('office_hour_schedules')->insert([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $normalService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '20:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => false,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $data = app(BookingPageService::class)->buildBookingPageData($mentor->fresh('services'), $student, [
+        'portal' => 'student',
+        'allow_office_hours' => true,
+        'selected_service' => 'office_hours',
+    ]);
+
+    expect($data['officeHours'])->toBeNull()
+        ->and(collect($data['services'])->contains(fn (array $service) => (bool) $service['isOfficeHours']))->toBeFalse()
+        ->and($data['selectedServiceId'])->toBe($normalService->service_slug);
+});
+
+it('includes the mentor avatar in booking page data', function () {
+    $student = makeUser('student-booking-avatar');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $mentor->user->forceFill([
+        'avatar_url' => '/storage/avatars/mentors/booking-avatar.jpg',
+    ])->save();
+
+    $service = makeService([
+        'service_slug' => 'program-insights-'.Str::lower(Str::random(5)),
+    ]);
+
+    attachMentorService($mentor, $service);
+
+    $data = app(BookingPageService::class)->buildBookingPageData($mentor->fresh('services'), $student, [
+        'portal' => 'student',
+        'allow_office_hours' => true,
+    ]);
+
+    expect($data['mentor']['avatarUrl'])->toBe('/storage/avatars/mentors/booking-avatar.jpg');
+});
+
+it('creates a booking from a selected availability slot and reserves it', function () {
+    $student = makeUser('booking-student');
+    $student->assignRole('student');
+    UserCredit::query()->create([
+        'user_id' => $student->id,
+        'balance' => 5,
+    ]);
+
+    $mentor = makeMentor();
+    $service = makeService([
+        'service_slug' => 'program-insights-'.Str::lower(Str::random(5)),
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+
+    DB::table('mentor_services')->insert([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'is_active' => true,
+        'sort_order' => 0,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $slotId = DB::table('mentor_availability_slots')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'slot_date' => now()->addDays(6)->toDateString(),
+        'start_time' => '13:00:00',
+        'end_time' => '14:00:00',
+        'timezone' => 'America/New_York',
+        'session_type' => '1on3',
+        'max_participants' => 3,
+        'booked_participants_count' => 0,
+        'is_booked' => false,
+        'is_blocked' => false,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    fakeZoomApi('zoom-group-slot-booking');
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $service->id,
+            'session_type' => '1on3',
+            'mentor_availability_slot_id' => $slotId,
+            'guest_participants' => [
+                ['full_name' => 'Guest Two', 'email' => 'guesttwo@example.edu'],
+                ['full_name' => 'Guest Three', 'email' => 'guestthree@example.edu'],
+            ],
+        ])
+        ->assertRedirect();
+
+    $this->assertDatabaseHas('bookings', [
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'mentor_availability_slot_id' => $slotId,
+        'session_type' => '1on3',
+        'status' => 'confirmed',
+        'approval_status' => 'not_required',
+        'is_group_payer' => true,
+        'group_payer_id' => $student->id,
+    ]);
+
+    $booking = Booking::query()->latest('id')->firstOrFail();
+
+    expect($booking->session_at?->timezoneName)->toBe('UTC')
+        ->and($booking->session_timezone)->toBe('America/New_York')
+        ->and($booking->session_at?->format('H:i'))->toBe('17:00')
+        ->and($booking->sessionAtInTimezone()?->format('H:i'))->toBe('13:00');
+
+    $this->assertDatabaseHas('mentor_availability_slots', [
+        'id' => $slotId,
+        'is_booked' => true,
+        'booked_participants_count' => 3,
+    ]);
+});
+
+it('queues a confirmation job and sends booking emails for 1on1 to student and mentor', function () {
+    Queue::fake();
+    fakeZoomApi();
+
+    $student = makeUser('booking-student');
+    $student->assignRole('student');
+    fundStudent($student);
+
+    $mentor = makeMentor();
+    $service = makeService([
+        'service_name' => 'Application Review',
+        'service_slug' => 'application-review-'.Str::lower(Str::random(5)),
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+
+    attachMentorService($mentor, $service);
+    $slotId = createAvailabilitySlot($mentor, $service, '1on1');
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $service->id,
+            'session_type' => '1on1',
+            'mentor_availability_slot_id' => $slotId,
+        ])
+        ->assertRedirect();
+
+    $booking = Booking::query()
+        ->with(['mentor.user', 'student', 'service', 'participantRecords'])
+        ->latest('id')
+        ->firstOrFail();
+
+    expect($booking->meeting_link)->toBe('https://zoom.us/j/9876543210')
+        ->and($booking->meeting_type)->toBe('zoom')
+        ->and($booking->calendar_provider)->toBe('zoom')
+        ->and($booking->calendar_sync_status)->toBe('synced')
+        ->and($booking->external_calendar_event_id)->toBe('zoom-meeting-123');
+
+    Queue::assertPushed(SendBookingConfirmationJob::class, function (SendBookingConfirmationJob $job) use ($booking) {
+        return $job->bookingId === $booking->id;
+    });
+
+    Mail::fake();
+
+    app()->call([new SendBookingConfirmationJob($booking->id), 'handle']);
+
+    Mail::assertSent(StudentBookingConfirmationMail::class, function (StudentBookingConfirmationMail $mail) use ($student, $mentor, $booking) {
+        return $mail->hasTo($student->email)
+            && $mail->bookingDetails['counterpart_name'] === $mentor->user->name
+            && $mail->bookingDetails['mentor_name'] === $mentor->user->name
+            && ! array_key_exists('mentor_email', $mail->bookingDetails)
+            && $mail->bookingDetails['session_time'] === '1:00 PM'
+            && $mail->bookingDetails['meeting_link'] === $booking->meeting_link
+            && ! str_contains($mail->render(), $mentor->user->email);
+    });
+
+    Mail::assertSent(MentorBookingNotificationMail::class, function (MentorBookingNotificationMail $mail) use ($mentor, $student, $booking) {
+        return $mail->hasTo($mentor->user->email)
+            && $mail->bookingDetails['counterpart_name'] === $student->name
+            && $mail->bookingDetails['student_email'] === $student->email
+            && $mail->bookingDetails['session_time'] === '1:00 PM'
+            && $mail->bookingDetails['meeting_link'] === route('mentor.bookings.start-meeting', $booking->id)
+            && $mail->bookingDetails['meeting_link_label'] === 'Start Zoom Meeting'
+            && str_contains($mail->render(), $student->email);
+    });
+});
+
+it('blocks the booking when zoom meeting creation fails', function () {
+    Queue::fake();
+
+    Http::fake([
+        'https://api.zoom.us/v2/users/me/meetings' => Http::response([
+            'message' => 'zoom create failed',
+        ], 500),
+    ]);
+
+    $student = makeUser('booking-student-failure');
+    $student->assignRole('student');
+    fundStudent($student);
+
+    $mentor = makeMentor();
+    $service = makeService([
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+    attachMentorService($mentor, $service);
+    $slotId = createAvailabilitySlot($mentor, $service, '1on1');
+
+    $this->actingAs($student)
+        ->from(route('student.bookings.index'))
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $service->id,
+            'session_type' => '1on1',
+            'mentor_availability_slot_id' => $slotId,
+        ])
+        ->assertRedirect(route('student.bookings.index'))
+        ->assertSessionHasErrors('booking');
+
+    expect(Booking::query()->count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
+it('refreshes a mentor zoom oauth token when it has expired', function () {
+    $mentor = makeMentor();
+    $mentorUser = User::query()->findOrFail($mentor->user_id);
+    $token = OauthToken::query()->where('user_id', $mentorUser->id)->where('provider', 'zoom')->firstOrFail();
+    $token->forceFill([
+        'access_token' => 'expired-access-token',
+        'refresh_token' => 'refresh-token-123',
+        'token_expires_at' => now()->subMinute(),
+    ])->save();
+
+    Http::fake([
+        'https://zoom.us/oauth/token' => Http::response([
+            'access_token' => 'zoom-access-token',
+            'refresh_token' => 'zoom-refresh-token',
+            'expires_in' => 3600,
+            'token_type' => 'Bearer',
+        ], 200),
+    ]);
+
+    expect(app(ZoomService::class)->accessTokenForUser($mentorUser))->toBe('zoom-access-token');
+    expect($token->fresh()->refresh_token)->toBe('zoom-refresh-token');
+});
+
+it('queues reminder emails for confirmed bookings in the selected reminder window', function () {
+    Queue::fake();
+    fakeZoomApi();
+
+    $student = makeUser('booking-student-reminder');
+    $student->assignRole('student');
+    fundStudent($student);
+
+    $mentor = makeMentor();
+    $service = makeService([
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+    attachMentorService($mentor, $service);
+    $slotId = createAvailabilitySlot($mentor, $service, '1on1');
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $service->id,
+            'session_type' => '1on1',
+            'mentor_availability_slot_id' => $slotId,
+        ])
+        ->assertRedirect();
+
+    $booking = Booking::query()->latest('id')->firstOrFail();
+
+    $booking->update([
+        'session_at' => now()->utc()->addHours(24),
+        'status' => 'confirmed',
+    ]);
+
+    $this->artisan('bookings:send-reminders', ['--hours' => 24])
+        ->assertSuccessful();
+
+    Queue::assertPushed(SendBookingReminderJob::class, fn (SendBookingReminderJob $job) => $job->bookingId === $booking->id && $job->hoursUntilSession === 24);
+});
+
+it('marks confirmed bookings completed only after the scheduled end time', function () {
+    $student = makeUser('completion-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $service = makeService([
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+    attachMentorService($mentor, $service);
+
+    $booking = Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'session_at' => now()->subMinutes(75),
+        'session_timezone' => 'UTC',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'status' => 'confirmed',
+        'approval_status' => 'not_required',
+    ]);
+
+    $futureBooking = Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'session_at' => now()->subMinutes(20),
+        'session_timezone' => 'UTC',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'status' => 'confirmed',
+        'approval_status' => 'not_required',
+    ]);
+
+    (new MarkCompletedBookingsJob)->handle(app(MarkCompletedBookingsService::class));
+
+    expect($booking->fresh()->status)->toBe('completed')
+        ->and($booking->fresh()->completion_source)->toBe('schedule')
+        ->and($booking->fresh()->session_outcome)->toBe('unknown')
+        ->and($booking->fresh()->completed_at)->not->toBeNull()
+        ->and($booking->fresh()->feedback_due_at)->not->toBeNull();
+
+    expect($futureBooking->fresh()->status)->toBe('confirmed')
+        ->and($futureBooking->fresh()->completed_at)->toBeNull();
+});
+
+it('stores zoom webhook events and does not complete unrelated bookings', function () {
+    config([
+        'services.zoom.webhook_secret_token' => 'zoom-secret-token',
+    ]);
+
+    $student = makeUser('webhook-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $service = makeService([
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+
+    $booking = Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'session_at' => now()->addHour(),
+        'session_timezone' => 'UTC',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'external_calendar_event_id' => '85787873250',
+        'status' => 'confirmed',
+        'approval_status' => 'not_required',
+    ]);
+
+    $payload = [
+        'event' => 'meeting.ended',
+        'event_id' => 'evt_zoom_end_123',
+        'event_ts' => now()->valueOf(),
+        'payload' => [
+            'object' => [
+                'id' => '85787873250',
+                'end_time' => now()->toIso8601String(),
+            ],
+        ],
+    ];
+
+    $raw = json_encode($payload, JSON_UNESCAPED_SLASHES);
+    $timestamp = (string) now()->timestamp;
+    $signature = 'v0='.hash_hmac('sha256', sprintf('v0:%s:%s', $timestamp, $raw), 'zoom-secret-token');
+
+    $this->withHeaders([
+        'x-zm-request-timestamp' => $timestamp,
+        'x-zm-signature' => $signature,
+    ])->postJson(route('webhooks.zoom'), $payload)
+        ->assertStatus(202);
+
+    expect(BookingMeetingEvent::query()->where('provider_meeting_id', '85787873250')->exists())->toBeTrue()
+        ->and($booking->fresh()->status)->toBe('confirmed')
+        ->and($booking->fresh()->completed_at)->toBeNull()
+        ->and($booking->fresh()->attendance_status)->toBe('pending');
+});
+
+it('classifies attended bookings from zoom evidence and unlocks feedback immediately', function () {
+    config([
+        'services.zoom.webhook_secret_token' => 'zoom-secret-token',
+        'services.zoom.attendance.minimum_overlap_minutes' => 5,
+    ]);
+
+    $student = makeUser('attendance-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $service = makeService();
+
+    $booking = Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'session_at' => now()->subMinutes(20),
+        'session_timezone' => 'UTC',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'external_calendar_event_id' => 'attendance-meeting-1',
+        'status' => 'confirmed',
+        'approval_status' => 'not_required',
+    ]);
+
+    $baseHeaders = function (array $payload): array {
+        $raw = json_encode($payload, JSON_UNESCAPED_SLASHES);
+        $timestamp = (string) now()->timestamp;
+
+        return [
+            'x-zm-request-timestamp' => $timestamp,
+            'x-zm-signature' => 'v0='.hash_hmac('sha256', sprintf('v0:%s:%s', $timestamp, $raw), 'zoom-secret-token'),
+        ];
+    };
+
+    $startedPayload = [
+        'event' => 'meeting.started',
+        'event_id' => 'evt_start_attended',
+        'event_ts' => now()->subMinutes(12)->valueOf(),
+        'payload' => [
+            'object' => [
+                'id' => 'attendance-meeting-1',
+                'start_time' => now()->subMinutes(12)->toIso8601String(),
+            ],
+        ],
+    ];
+
+    $hostJoinedPayload = [
+        'event' => 'meeting.participant_joined',
+        'event_id' => 'evt_host_join',
+        'event_ts' => now()->subMinutes(11)->valueOf(),
+        'payload' => [
+            'object' => [
+                'id' => 'attendance-meeting-1',
+                'host_email' => 'host@example.com',
+                'participant' => [
+                    'user_name' => 'host@example.com',
+                    'host' => true,
+                ],
+            ],
+        ],
+    ];
+
+    $attendeeJoinedPayload = [
+        'event' => 'meeting.participant_joined',
+        'event_id' => 'evt_attendee_join',
+        'event_ts' => now()->subMinutes(10)->valueOf(),
+        'payload' => [
+            'object' => [
+                'id' => 'attendance-meeting-1',
+                'host_email' => 'host@example.com',
+                'participant' => [
+                    'user_name' => 'student@example.com',
+                    'host' => false,
+                ],
+            ],
+        ],
+    ];
+
+    $endedPayload = [
+        'event' => 'meeting.ended',
+        'event_id' => 'evt_end_attended',
+        'event_ts' => now()->subMinutes(2)->valueOf(),
+        'payload' => [
+            'object' => [
+                'id' => 'attendance-meeting-1',
+                'end_time' => now()->subMinutes(2)->toIso8601String(),
+            ],
+        ],
+    ];
+
+    foreach ([$startedPayload, $hostJoinedPayload, $attendeeJoinedPayload, $endedPayload] as $payload) {
+        $this->withHeaders($baseHeaders($payload))
+            ->postJson(route('webhooks.zoom'), $payload)
+            ->assertStatus(202);
+    }
+
+    $booking = $booking->fresh();
+
+    expect($booking->attendance_status)->toBe('attended')
+        ->and($booking->completion_source)->toBe('zoom_event')
+        ->and($booking->attendance_overlap_minutes)->toBeGreaterThanOrEqual(5)
+        ->and($booking->feedback_unlocked_at)->not->toBeNull();
+
+    $feedback = app(FeedbackService::class)->storeStudentFeedback($student, [
+        'booking_id' => $booking->id,
+        'stars' => 5,
+        'comment' => 'Great session.',
+        'recommend' => true,
+    ]);
+
+    expect($feedback->booking_id)->toBe($booking->id)
+        ->and($booking->fresh()->student_feedback_done)->toBeTrue();
+});
+
+it('blocks students from creating new bookings when completed session feedback is overdue', function () {
+    $student = makeUser('overdue-feedback-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $service = makeService([
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+
+    Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'session_at' => now()->subDays(2),
+        'session_timezone' => 'UTC',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'status' => 'completed',
+        'approval_status' => 'not_required',
+        'feedback_due_at' => now()->subHour(),
+        'student_feedback_done' => false,
+        'mentor_feedback_done' => true,
+    ]);
+
+    expect(fn () => app(BookingService::class)->createBooking($student, [
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'mentor_availability_slot_id' => 12345,
+    ], ['charge_credits' => false]))->toThrow(
+        BookingException::class,
+        'Please submit feedback for your completed session before booking another meeting.'
+    );
+
+    $this->actingAs($student)
+        ->get(route('student.dashboard'))
+        ->assertRedirect(route('student.bookings.index'))
+        ->assertSessionHas('warning', 'Please complete your pending session feedback before continuing in the student portal.');
+
+    $this->actingAs($student)
+        ->get(route('student.bookings.index'))
+        ->assertOk();
+});
+
+it('blocks mentors from creating or receiving new bookings when session notes are overdue', function () {
+    $mentor = makeMentor();
+    $targetMentor = makeMentor();
+    $student = makeUser('mentor-notes-lock-student');
+    $student->assignRole('student');
+    $service = makeService([
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+
+    Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'session_at' => now()->subDays(2),
+        'session_timezone' => 'UTC',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'status' => 'completed',
+        'approval_status' => 'not_required',
+        'completed_at' => now()->subDays(2),
+        'feedback_due_at' => null,
+        'student_feedback_done' => true,
+        'mentor_feedback_done' => false,
+    ]);
+
+    $mentorUser = User::query()->findOrFail($mentor->user_id);
+
+    expect(fn () => app(BookingService::class)->createBooking($mentorUser, [
+        'mentor_id' => $targetMentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'mentor_availability_slot_id' => 12345,
+    ], ['charge_credits' => false]))->toThrow(
+        BookingException::class,
+        'This mentor has overdue session notes. New bookings are paused until those notes are completed.'
+    );
+
+    expect(fn () => app(BookingService::class)->createBooking($student, [
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'mentor_availability_slot_id' => 12345,
+    ], ['charge_credits' => false]))->toThrow(
+        BookingException::class,
+        'This mentor has overdue session notes. New bookings are paused until those notes are completed.'
+    );
+});
+
+it('classifies interrupted bookings conservatively when overlap is below the threshold', function () {
+    config([
+        'services.zoom.webhook_secret_token' => 'zoom-secret-token',
+        'services.zoom.attendance.minimum_overlap_minutes' => 5,
+    ]);
+
+    $student = makeUser('interrupt-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $service = makeService();
+
+    $booking = Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'session_at' => now()->subMinutes(20),
+        'session_timezone' => 'UTC',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'external_calendar_event_id' => 'attendance-meeting-2',
+        'status' => 'confirmed',
+        'approval_status' => 'not_required',
+    ]);
+
+    $postEvent = function (array $payload): void {
+        $raw = json_encode($payload, JSON_UNESCAPED_SLASHES);
+        $timestamp = (string) now()->timestamp;
+
+        $this->withHeaders([
+            'x-zm-request-timestamp' => $timestamp,
+            'x-zm-signature' => 'v0='.hash_hmac('sha256', sprintf('v0:%s:%s', $timestamp, $raw), 'zoom-secret-token'),
+        ])->postJson(route('webhooks.zoom'), $payload)->assertStatus(202);
+    };
+
+    $postEvent([
+        'event' => 'meeting.participant_joined',
+        'event_id' => 'evt_interrupt_host',
+        'event_ts' => now()->subMinutes(4)->valueOf(),
+        'payload' => [
+            'object' => [
+                'id' => 'attendance-meeting-2',
+                'host_email' => 'host@example.com',
+                'participant' => ['user_name' => 'host@example.com', 'host' => true],
+            ],
+        ],
+    ]);
+
+    $postEvent([
+        'event' => 'meeting.participant_joined',
+        'event_id' => 'evt_interrupt_attendee',
+        'event_ts' => now()->subMinutes(3)->valueOf(),
+        'payload' => [
+            'object' => [
+                'id' => 'attendance-meeting-2',
+                'host_email' => 'host@example.com',
+                'participant' => ['user_name' => 'student@example.com', 'host' => false],
+            ],
+        ],
+    ]);
+
+    $postEvent([
+        'event' => 'meeting.ended',
+        'event_id' => 'evt_interrupt_end',
+        'event_ts' => now()->subMinute()->valueOf(),
+        'payload' => [
+            'object' => [
+                'id' => 'attendance-meeting-2',
+                'end_time' => now()->subMinute()->toIso8601String(),
+            ],
+        ],
+    ]);
+
+    expect($booking->fresh()->attendance_status)->toBe('interrupted')
+        ->and($booking->fresh()->session_outcome)->toBe('interrupted');
+});
+
+it('records host joined time when zoom only supplies host email on earlier events', function () {
+    config([
+        'services.zoom.webhook_secret_token' => 'zoom-secret-token',
+    ]);
+
+    $student = makeUser('host-email-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $service = makeService();
+
+    $booking = Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'session_at' => now()->addDays(2),
+        'session_timezone' => 'UTC',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'external_calendar_event_id' => 'attendance-meeting-host-email',
+        'status' => 'confirmed',
+        'approval_status' => 'not_required',
+    ]);
+
+    $postEvent = function (array $payload): void {
+        $raw = json_encode($payload, JSON_UNESCAPED_SLASHES);
+        $timestamp = (string) now()->timestamp;
+
+        $this->withHeaders([
+            'x-zm-request-timestamp' => $timestamp,
+            'x-zm-signature' => 'v0='.hash_hmac('sha256', sprintf('v0:%s:%s', $timestamp, $raw), 'zoom-secret-token'),
+        ])->postJson(route('webhooks.zoom'), $payload)->assertStatus(202);
+    };
+
+    $postEvent([
+        'event' => 'meeting.started',
+        'event_id' => 'evt_host_email_start',
+        'event_ts' => now()->subMinute()->valueOf(),
+        'payload' => [
+            'object' => [
+                'id' => 'attendance-meeting-host-email',
+                'host_email' => 'host@example.com',
+                'start_time' => now()->subMinute()->toIso8601String(),
+            ],
+        ],
+    ]);
+
+    $postEvent([
+        'event' => 'meeting.participant_joined',
+        'event_id' => 'evt_host_email_join',
+        'event_ts' => now()->valueOf(),
+        'payload' => [
+            'object' => [
+                'id' => 'attendance-meeting-host-email',
+                'participant' => [
+                    'user_name' => 'Host Example',
+                    'email' => 'host@example.com',
+                ],
+            ],
+        ],
+    ]);
+
+    $booking = $booking->fresh();
+
+    expect($booking->host_joined_at)->not->toBeNull()
+        ->and($booking->first_attendee_joined_at)->toBeNull()
+        ->and($booking->attendance_status)->toBe('pending');
+});
+
+it('unlocks feedback after the fallback grace period even without zoom attendance evidence', function () {
+    config([
+        'services.zoom.attendance.feedback_fallback_grace_minutes' => 60,
+    ]);
+
+    $student = makeUser('fallback-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $service = makeService();
+
+    $booking = Booking::query()->create([
+        'student_id' => $student->id,
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'session_type' => '1on1',
+        'session_at' => now()->subHours(3),
+        'session_timezone' => 'UTC',
+        'duration_minutes' => 60,
+        'meeting_type' => 'zoom',
+        'status' => 'confirmed',
+        'approval_status' => 'not_required',
+    ]);
+
+    (new MarkCompletedBookingsJob)->handle(app(MarkCompletedBookingsService::class));
+
+    $booking = $booking->fresh();
+
+    expect($booking->status)->toBe('completed')
+        ->and($booking->attendance_status)->toBe('unknown')
+        ->and($booking->feedback_unlocked_at)->not->toBeNull()
+        ->and($booking->feedbackUnlocked())->toBeTrue();
+
+    $feedback = app(FeedbackService::class)->storeStudentFeedback($student, [
+        'booking_id' => $booking->id,
+        'stars' => 4,
+        'comment' => 'Fallback feedback worked.',
+        'recommend' => true,
+    ]);
+
+    expect($feedback->booking_id)->toBe($booking->id);
+});
+
+it('allows a mentor to cancel more than 12 hours ahead and sends cancellation notifications', function () {
+    Mail::fake();
+    fakeZoomApi();
+
+    $student = makeUser('cancel-student');
+    $student->assignRole('student');
+    fundStudent($student);
+
+    $mentor = makeMentor();
+    $service = makeService([
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+    attachMentorService($mentor, $service);
+    $slotId = createAvailabilitySlot($mentor, $service, '1on1', 5);
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $service->id,
+            'session_type' => '1on1',
+            'mentor_availability_slot_id' => $slotId,
+        ])
+        ->assertRedirect();
+
+    $booking = Booking::query()->with('mentor.user')->latest('id')->firstOrFail();
+
+    $this->actingAs($mentor->user)
+        ->patch(route('mentor.bookings.cancel', $booking->id), [
+            'reason' => 'Mentor cancelled from test.',
+        ])
+        ->assertRedirect(route('mentor.bookings.index'));
+
+    expect($booking->fresh()->status)->toBe('cancelled')
+        ->and($booking->fresh()->calendar_sync_status)->toBe('cancelled');
+
+    $this->assertDatabaseHas('mentor_availability_slots', [
+        'id' => $slotId,
+        'is_booked' => false,
+        'booked_participants_count' => 0,
+    ]);
+
+    Mail::assertSent(BookingCancelledNotificationMail::class);
+});
+
+it('blocks self-cancellation inside 12 hours for both students and mentors', function () {
+    fakeZoomApi();
+
+    $student = makeUser('late-cancel-student');
+    $student->assignRole('student');
+    fundStudent($student);
+
+    $mentor = makeMentor();
+    $service = makeService([
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+    attachMentorService($mentor, $service);
+    $sessionStart = now('America/New_York')->addHours(11);
+    $sessionEnd = $sessionStart->copy()->addHour();
+
+    $slotId = DB::table('mentor_availability_slots')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'service_config_id' => $service->id,
+        'slot_date' => $sessionStart->toDateString(),
+        'start_time' => $sessionStart->format('H:i:s'),
+        'end_time' => $sessionEnd->format('H:i:s'),
+        'timezone' => 'America/New_York',
+        'session_type' => '1on1',
+        'max_participants' => 1,
+        'booked_participants_count' => 0,
+        'is_booked' => false,
+        'is_blocked' => false,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $service->id,
+            'session_type' => '1on1',
+            'mentor_availability_slot_id' => $slotId,
+        ])
+        ->assertRedirect();
+
+    $booking = Booking::query()->latest('id')->firstOrFail();
+
+    $this->actingAs($student)
+        ->patch(route('student.bookings.cancel', $booking->id), [
+            'reason' => 'Too late student cancel.',
+        ])
+        ->assertSessionHasErrors('booking');
+
+    $this->actingAs($mentor->user)
+        ->patch(route('mentor.bookings.cancel', $booking->id), [
+            'reason' => 'Too late mentor cancel.',
+        ])
+        ->assertSessionHasErrors('booking');
+
+    expect($booking->fresh()->status)->toBe('confirmed');
+});
+
+it('queues a confirmation job and sends booking emails for 1on3 to mentor and all participants without duplicates', function () {
+    Queue::fake();
+
+    $student = makeUser('booking-student');
+    $student->assignRole('student');
+    fundStudent($student);
+
+    $mentor = makeMentor();
+    $service = makeService([
+        'service_name' => 'Program Insights',
+        'service_slug' => 'program-insights-'.Str::lower(Str::random(5)),
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+
+    attachMentorService($mentor, $service);
+    $slotId = createAvailabilitySlot($mentor, $service, '1on3');
+    fakeZoomApi('zoom-group-email-1on3');
+
+    $guestEmailOne = 'guestone@example.edu';
+    $guestEmailTwo = 'guesttwo@example.edu';
+    $registeredGuest = makeUser('booking-guest');
+    $registeredGuest->assignRole('student');
+    $registeredGuest->forceFill(['email' => $guestEmailOne])->save();
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $service->id,
+            'session_type' => '1on3',
+            'mentor_availability_slot_id' => $slotId,
+            'guest_participants' => [
+                ['full_name' => 'Guest One', 'email' => $guestEmailOne],
+                ['full_name' => 'Guest Two', 'email' => $guestEmailTwo],
+            ],
+        ])
+        ->assertRedirect();
+
+    $booking = Booking::query()
+        ->with(['mentor.user', 'student', 'service', 'participantRecords'])
+        ->latest('id')
+        ->firstOrFail();
+
+    Queue::assertPushed(SendBookingConfirmationJob::class, fn (SendBookingConfirmationJob $job) => $job->bookingId === $booking->id);
+
+    Mail::fake();
+
+    app()->call([new SendBookingConfirmationJob($booking->id), 'handle']);
+
+    Mail::assertSent(MentorBookingNotificationMail::class, 1);
+    Mail::assertSent(StudentBookingConfirmationMail::class, 3);
+
+    $this->assertDatabaseHas('booking_participants', [
+        'booking_id' => $booking->id,
+        'email' => $guestEmailOne,
+        'user_id' => $registeredGuest->id,
+        'invite_status' => 'accepted',
+    ]);
+
+    Mail::assertSent(StudentBookingConfirmationMail::class, fn (StudentBookingConfirmationMail $mail) => $mail->hasTo($student->email));
+    Mail::assertSent(StudentBookingConfirmationMail::class, function (StudentBookingConfirmationMail $mail) use ($booking, $guestEmailOne) {
+        return $mail->hasTo($guestEmailOne)
+            && $mail->bookingDetails['meeting_link'] === route('student.bookings.join-meeting', $booking->id)
+            && $mail->bookingDetails['meeting_link_label'] === 'Join Zoom Meeting';
+    });
+    Mail::assertSent(StudentBookingConfirmationMail::class, function (StudentBookingConfirmationMail $mail) use ($booking, $guestEmailTwo) {
+        return $mail->hasTo($guestEmailTwo)
+            && $mail->bookingDetails['meeting_link'] === $booking->meeting_link
+            && $mail->bookingDetails['meeting_link_label'] === 'Open Zoom Meeting';
+    });
+});
+
+it('queues a confirmation job and sends booking emails for 1on5 to mentor and all participants', function () {
+    Queue::fake();
+
+    $student = makeUser('booking-student');
+    $student->assignRole('student');
+    fundStudent($student);
+
+    $mentor = makeMentor();
+    $service = makeService([
+        'service_name' => 'Interview Prep',
+        'service_slug' => 'interview-prep-'.Str::lower(Str::random(5)),
+        'price_1on1' => 0,
+        'price_1on3_per_person' => 0,
+        'price_1on3_total' => 0,
+        'price_1on5_per_person' => 0,
+        'price_1on5_total' => 0,
+    ]);
+
+    attachMentorService($mentor, $service);
+    $slotId = createAvailabilitySlot($mentor, $service, '1on5');
+    fakeZoomApi('zoom-group-email-1on5');
+
+    $guestParticipants = [
+        ['full_name' => 'Guest One', 'email' => 'guestone@example.edu'],
+        ['full_name' => 'Guest Two', 'email' => 'guesttwo@example.edu'],
+        ['full_name' => 'Guest Three', 'email' => 'guestthree@example.edu'],
+        ['full_name' => 'Guest Four', 'email' => 'guestfour@example.edu'],
+    ];
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $service->id,
+            'session_type' => '1on5',
+            'mentor_availability_slot_id' => $slotId,
+            'guest_participants' => $guestParticipants,
+        ])
+        ->assertRedirect();
+
+    $booking = Booking::query()
+        ->with(['mentor.user', 'student', 'service', 'participantRecords'])
+        ->latest('id')
+        ->firstOrFail();
+
+    Queue::assertPushed(SendBookingConfirmationJob::class, fn (SendBookingConfirmationJob $job) => $job->bookingId === $booking->id);
+
+    Mail::fake();
+
+    app()->call([new SendBookingConfirmationJob($booking->id), 'handle']);
+
+    Mail::assertSent(MentorBookingNotificationMail::class, 1);
+    Mail::assertSent(StudentBookingConfirmationMail::class, 5);
+
+    foreach ($guestParticipants as $participant) {
+        Mail::assertSent(StudentBookingConfirmationMail::class, fn (StudentBookingConfirmationMail $mail) => $mail->hasTo($participant['email']));
+    }
+});
+
+it('queues a confirmation job and sends booking emails for office hours', function () {
+    Queue::fake();
+    fakeZoomApi('office-zoom-no-standard-emails', 'https://zoom.us/j/office-no-standard-emails');
+
+    $student = makeUser('office-hours-booking-student');
+    $student->assignRole('student');
+    fundStudent($student);
+
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office-hours-'.Str::lower(Str::random(5)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $supportService = makeService([
+        'service_name' => 'Interview Prep',
+        'service_slug' => 'interview-prep-'.Str::lower(Str::random(5)),
+    ]);
+
+    DB::table('mentor_services')->insert([
+        [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $officeHoursService->id,
+            'is_active' => true,
+            'sort_order' => 0,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ],
+        [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $supportService->id,
+            'is_active' => true,
+            'sort_order' => 1,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ],
+    ]);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $supportService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 0,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $officeHoursService->id,
+            'session_type' => 'office_hours',
+            'office_hour_session_id' => $sessionId,
+        ])
+        ->assertRedirect();
+
+    $booking = Booking::query()->latest('id')->firstOrFail();
+
+    Queue::assertPushed(SendBookingConfirmationJob::class, fn (SendBookingConfirmationJob $job) => $job->bookingId === $booking->id);
+
+    Mail::fake();
+
+    app()->call([new SendBookingConfirmationJob($booking->id), 'handle']);
+
+    Mail::assertSent(MentorBookingNotificationMail::class, function (MentorBookingNotificationMail $mail) use ($booking, $mentor, $student) {
+        return $mail->hasTo($mentor->user->email)
+            && $mail->bookingDetails['counterpart_name'] === $student->name
+            && $mail->bookingDetails['meeting_link'] === route('mentor.bookings.start-meeting', $booking->id)
+            && $mail->bookingDetails['meeting_link_label'] === 'Start Zoom Meeting';
+    });
+
+    Mail::assertSent(StudentBookingConfirmationMail::class, function (StudentBookingConfirmationMail $mail) use ($booking, $student, $mentor) {
+        return $mail->hasTo($student->email)
+            && $mail->bookingDetails['counterpart_name'] === $mentor->user->name
+            && $mail->bookingDetails['meeting_link'] === $booking->meeting_link
+            && $mail->bookingDetails['meeting_link_label'] === 'Open Zoom Meeting';
+    });
+});
+
+it('creates one shared zoom meeting for an office-hours session on first booking', function () {
+    Queue::fake();
+    fakeZoomApi('office-zoom-123', 'https://zoom.us/j/office123');
+
+    $student = makeUser('office-link-student');
+    $student->assignRole('student');
+    fundStudent($student);
+
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $focusService = makeService(['service_name' => 'Program Insights']);
+
+    DB::table('mentor_services')->insert([
+        ['mentor_id' => $mentor->id, 'service_config_id' => $officeHoursService->id, 'is_active' => true, 'sort_order' => 0, 'created_at' => now(), 'updated_at' => now()],
+        ['mentor_id' => $mentor->id, 'service_config_id' => $focusService->id, 'is_active' => true, 'sort_order' => 1, 'created_at' => now(), 'updated_at' => now()],
+    ]);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $focusService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $focusService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 0,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $officeHoursService->id,
+            'session_type' => 'office_hours',
+            'office_hour_session_id' => $sessionId,
+        ])
+        ->assertRedirect();
+
+    $booking = Booking::query()->latest('id')->firstOrFail();
+
+    $this->assertDatabaseHas('office_hour_sessions', [
+        'id' => $sessionId,
+        'meeting_link' => 'https://zoom.us/j/office123',
+        'external_calendar_event_id' => 'office-zoom-123',
+        'calendar_provider' => 'zoom',
+        'calendar_sync_status' => 'synced',
+    ]);
+
+    expect($booking->meeting_link)->toBe('https://zoom.us/j/office123')
+        ->and($booking->external_calendar_event_id)->toBe('office-zoom-123')
+        ->and($booking->calendar_provider)->toBe('zoom')
+        ->and($booking->calendar_sync_status)->toBe('synced')
+        ->and($booking->credits_charged)->toBe(1);
+
+    Http::assertSentCount(1);
+});
+
+it('reuses the existing office-hours zoom meeting for later attendees', function () {
+    Queue::fake();
+    fakeZoomApi('office-zoom-reuse', 'https://zoom.us/j/reuse');
+
+    $firstStudent = makeUser('office-link-first');
+    $firstStudent->assignRole('student');
+    fundStudent($firstStudent);
+    $secondStudent = makeUser('office-link-second');
+    $secondStudent->assignRole('student');
+    fundStudent($secondStudent);
+
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $focusService = makeService(['service_name' => 'Tutoring']);
+
+    DB::table('mentor_services')->insert([
+        ['mentor_id' => $mentor->id, 'service_config_id' => $officeHoursService->id, 'is_active' => true, 'sort_order' => 0, 'created_at' => now(), 'updated_at' => now()],
+        ['mentor_id' => $mentor->id, 'service_config_id' => $focusService->id, 'is_active' => true, 'sort_order' => 1, 'created_at' => now(), 'updated_at' => now()],
+    ]);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $focusService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $focusService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 0,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    foreach ([$firstStudent, $secondStudent] as $student) {
+        $this->actingAs($student)
+            ->post(route('student.bookings.store'), [
+                'mentor_id' => $mentor->id,
+                'service_config_id' => $officeHoursService->id,
+                'session_type' => 'office_hours',
+                'office_hour_session_id' => $sessionId,
+            ])
+            ->assertRedirect();
+    }
+
+    $bookings = Booking::query()
+        ->where('office_hour_session_id', $sessionId)
+        ->orderBy('id')
+        ->get();
+
+    expect($bookings)->toHaveCount(2)
+        ->and($bookings[0]->meeting_link)->toBe('https://zoom.us/j/reuse')
+        ->and($bookings[1]->meeting_link)->toBe('https://zoom.us/j/reuse')
+        ->and((int) DB::table('office_hour_sessions')->where('id', $sessionId)->value('current_occupancy'))->toBe(2);
+
+    Http::assertSentCount(1);
+});
+
+it('rolls back office-hours booking when zoom meeting creation fails', function () {
+    Queue::fake();
+    Http::fake([
+        'https://api.zoom.us/v2/users/me/meetings' => Http::response(['message' => 'Zoom down'], 500),
+    ]);
+
+    $student = makeUser('office-link-fail');
+    $student->assignRole('student');
+    fundStudent($student, 1);
+
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $focusService = makeService(['service_name' => 'Application Review']);
+
+    DB::table('mentor_services')->insert([
+        ['mentor_id' => $mentor->id, 'service_config_id' => $officeHoursService->id, 'is_active' => true, 'sort_order' => 0, 'created_at' => now(), 'updated_at' => now()],
+        ['mentor_id' => $mentor->id, 'service_config_id' => $focusService->id, 'is_active' => true, 'sort_order' => 1, 'created_at' => now(), 'updated_at' => now()],
+    ]);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $focusService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $focusService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 0,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $officeHoursService->id,
+            'session_type' => 'office_hours',
+            'office_hour_session_id' => $sessionId,
+        ])
+        ->assertSessionHasErrors('booking');
+
+    expect(Booking::query()->where('office_hour_session_id', $sessionId)->count())->toBe(0)
+        ->and((int) DB::table('office_hour_sessions')->where('id', $sessionId)->value('current_occupancy'))->toBe(0)
+        ->and((int) UserCredit::query()->where('user_id', $student->id)->value('balance'))->toBe(1);
+});
+
+it('blocks office-hours booking when the mentor has not connected zoom', function () {
+    Queue::fake();
+    Http::fake();
+
+    $student = makeUser('office-link-nozoom');
+    $student->assignRole('student');
+    fundStudent($student, 1);
+
+    $mentor = makeMentor();
+    OauthToken::query()->where('user_id', $mentor->user_id)->where('provider', 'zoom')->delete();
+
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $focusService = makeService(['service_name' => 'Program Insights']);
+
+    DB::table('mentor_services')->insert([
+        ['mentor_id' => $mentor->id, 'service_config_id' => $officeHoursService->id, 'is_active' => true, 'sort_order' => 0, 'created_at' => now(), 'updated_at' => now()],
+        ['mentor_id' => $mentor->id, 'service_config_id' => $focusService->id, 'is_active' => true, 'sort_order' => 1, 'created_at' => now(), 'updated_at' => now()],
+    ]);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $focusService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $focusService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 0,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->post(route('student.bookings.store'), [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $officeHoursService->id,
+            'session_type' => 'office_hours',
+            'office_hour_session_id' => $sessionId,
+        ])
+        ->assertSessionHasErrors('booking');
+
+    expect(Booking::query()->where('office_hour_session_id', $sessionId)->count())->toBe(0)
+        ->and((int) DB::table('office_hour_sessions')->where('id', $sessionId)->value('current_occupancy'))->toBe(0)
+        ->and((int) UserCredit::query()->where('user_id', $student->id)->value('balance'))->toBe(1);
+
+    Http::assertNothingSent();
+});
+
+it('renders dynamic office hours data from upcoming sessions', function () {
+    $student = makeUser('office-hours-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $supportService = makeService([
+        'service_name' => 'Interview Prep',
+        'service_slug' => 'interview_prep_'.Str::lower(Str::random(6)),
+    ]);
+
+    DB::table('mentor_services')->insert([
+        [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $officeHoursService->id,
+            'is_active' => true,
+            'sort_order' => 0,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ],
+        [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $supportService->id,
+            'is_active' => true,
+            'sort_order' => 1,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ],
+    ]);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    DB::table('office_hour_sessions')->insert([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $supportService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 2,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => true,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->get(route('student.office-hours'))
+        ->assertOk()
+        ->assertViewHas('officeHoursData', function (array $officeHoursData) use ($mentor) {
+            return collect($officeHoursData)->contains(function (array $row) use ($mentor) {
+                return (int) $row['id'] === (int) $mentor->id
+                    && (int) $row['spotsFilled'] === 2
+                    && (int) $row['maxSpots'] === 3
+                    && $row['isBookable'] === true;
+            });
+        });
+});
+
+it('orders office-hours mentors by admin override rating before calculated rating', function () {
+    $student = makeUser('office-hours-override-order-student');
+    $student->assignRole('student');
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $focusService = makeService([
+        'service_name' => 'Program Insights',
+        'service_slug' => 'program_insights_'.Str::lower(Str::random(6)),
+    ]);
+    $overrideMentor = makeMentor();
+    $calculatedMentor = makeMentor();
+
+    MentorRating::query()->create([
+        'mentor_id' => $overrideMentor->id,
+        'avg_stars' => 4.10,
+        'admin_rating_override' => 5.00,
+        'recommend_rate' => 100,
+        'total_reviews' => 1,
+        'total_sessions' => 1,
+    ]);
+    MentorRating::query()->create([
+        'mentor_id' => $calculatedMentor->id,
+        'avg_stars' => 4.90,
+        'recommend_rate' => 100,
+        'total_reviews' => 10,
+        'total_sessions' => 10,
+    ]);
+
+    foreach ([$overrideMentor, $calculatedMentor] as $index => $mentor) {
+        DB::table('mentor_services')->insert([
+            ['mentor_id' => $mentor->id, 'service_config_id' => $officeHoursService->id, 'is_active' => true, 'sort_order' => 0, 'created_at' => now(), 'updated_at' => now()],
+            ['mentor_id' => $mentor->id, 'service_config_id' => $focusService->id, 'is_active' => true, 'sort_order' => 1, 'created_at' => now(), 'updated_at' => now()],
+        ]);
+
+        $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+            'mentor_id' => $mentor->id,
+            'current_service_id' => $focusService->id,
+            'day_of_week' => 'tue',
+            'start_time' => sprintf('%02d:00:00', 17 + $index),
+            'timezone' => 'America/New_York',
+            'frequency' => 'weekly',
+            'max_spots' => 3,
+            'is_active' => true,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        DB::table('office_hour_sessions')->insert([
+            'schedule_id' => $scheduleId,
+            'current_service_id' => $focusService->id,
+            'session_date' => now()->addDays(7)->toDateString(),
+            'start_time' => sprintf('%02d:00:00', 17 + $index),
+            'timezone' => 'America/New_York',
+            'current_occupancy' => 0,
+            'max_spots' => 3,
+            'is_full' => false,
+            'service_locked' => false,
+            'status' => 'upcoming',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+    }
+
+    $this->actingAs($student)
+        ->get(route('student.office-hours'))
+        ->assertOk()
+        ->assertViewHas('officeHoursData', function (array $officeHoursData) use ($overrideMentor, $calculatedMentor) {
+            $ids = collect($officeHoursData)->pluck('id')->map(fn ($id) => (int) $id)->all();
+
+            return array_slice($ids, 0, 2) === [$overrideMentor->id, $calculatedMentor->id]
+                && (float) $officeHoursData[0]['rating'] === 5.0;
+        });
+});
+
+it('shows office-hours mentors without active upcoming sessions as not bookable', function () {
+    $student = makeUser('office-hours-directory-disabled-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $supportService = makeService([
+        'service_name' => 'Interview Prep',
+        'service_slug' => 'interview_prep_'.Str::lower(Str::random(6)),
+    ]);
+
+    attachMentorService($mentor, $officeHoursService);
+    attachMentorService($mentor, $supportService);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $supportService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => false,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    DB::table('office_hour_sessions')->insert([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $supportService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 0,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->get(route('student.office-hours'))
+        ->assertOk()
+        ->assertViewHas('officeHoursData', function (array $officeHoursData) use ($mentor) {
+            return collect($officeHoursData)->contains(function (array $row) use ($mentor) {
+                return (int) $row['id'] === (int) $mentor->id
+                    && $row['isBookable'] === false
+                    && $row['weeklyService'] === 'Interview Prep'
+                    && $row['sessionTime'] === 'Schedule coming soon'
+                    && (int) $row['spotsFilled'] === 0;
+            });
+        });
+});
+
+it('excludes mentors without the office-hours service from the office-hours directory even with an active schedule', function () {
+    $student = makeUser('office-hours-directory-service-disabled-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $supportService = makeService([
+        'service_name' => 'Interview Prep',
+        'service_slug' => 'interview_prep_'.Str::lower(Str::random(6)),
+    ]);
+
+    attachMentorService($mentor, $supportService);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $supportService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    DB::table('office_hour_sessions')->insert([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $supportService->id,
+        'session_date' => now()->addDays(7)->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 0,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->get(route('student.office-hours'))
+        ->assertOk()
+        ->assertViewHas('officeHoursData', function (array $officeHoursData) use ($mentor) {
+            return ! collect($officeHoursData)->contains(fn (array $row) => (int) $row['id'] === (int) $mentor->id);
+        });
+});
+
+it('syncs the next weekly office-hours session and rotates the service focus', function () {
+    $this->travelTo(Carbon::parse('2026-05-04 10:00:00', 'America/New_York'));
+
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'price_1on1' => null,
+        'price_1on3_per_person' => null,
+        'price_1on3_total' => null,
+        'price_1on5_per_person' => null,
+        'price_1on5_total' => null,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+        'sort_order' => 0,
+    ]);
+    $firstService = makeService(['service_name' => 'Tutoring', 'sort_order' => 1]);
+    $unsupportedService = makeService(['service_name' => 'Application Review', 'sort_order' => 2]);
+    $secondService = makeService(['service_name' => 'Interview Prep', 'sort_order' => 2]);
+
+    DB::table('mentor_services')->insert([
+        [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $officeHoursService->id,
+            'is_active' => true,
+            'sort_order' => 0,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ],
+        [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $firstService->id,
+            'is_active' => true,
+            'sort_order' => 1,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ],
+        [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $unsupportedService->id,
+            'is_active' => true,
+            'sort_order' => 2,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ],
+        [
+            'mentor_id' => $mentor->id,
+            'service_config_id' => $secondService->id,
+            'is_active' => true,
+            'sort_order' => 3,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ],
+    ]);
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $firstService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->artisan('office-hours:sync-sessions')->assertExitCode(0);
+    $this->artisan('office-hours:sync-sessions')->assertExitCode(0);
+
+    $sessions = DB::table('office_hour_sessions')->where('schedule_id', $scheduleId)->get();
+
+    expect($sessions)->toHaveCount(1);
+
+    $session = $sessions->first();
+
+    expect((int) $session->current_service_id)->toBe((int) $secondService->id)
+        ->and($session->session_date)->toBe('2026-05-05')
+        ->and($session->start_time)->toBe('17:00:00')
+        ->and(Carbon::parse($session->service_choice_cutoff_at, 'UTC')->toIso8601String())
+        ->toBe(Carbon::parse('2026-05-05 17:00:00', 'America/New_York')->subHours(12)->utc()->toIso8601String());
+
+    $this->assertDatabaseHas('office_hour_schedules', [
+        'id' => $scheduleId,
+        'current_service_id' => $secondService->id,
+    ]);
+});
+
+it('lets the first office-hours booker choose a mentor service between 24 and 12 hours before start', function () {
+    $student = makeUser('office-choice-student');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $officeHoursService = makeService([
+        'service_name' => 'Office Hours',
+        'service_slug' => 'office_hours_'.Str::lower(Str::random(6)),
+        'is_office_hours' => true,
+        'office_hours_subscription_price' => 200,
+        'office_hours_mentor_payout_per_attendee' => 15,
+    ]);
+    $initialService = makeService(['service_name' => 'Tutoring']);
+    $choiceService = makeService(['service_name' => 'Interview Prep']);
+
+    DB::table('mentor_services')->insert([
+        ['mentor_id' => $mentor->id, 'service_config_id' => $officeHoursService->id, 'is_active' => true, 'sort_order' => 0, 'created_at' => now(), 'updated_at' => now()],
+        ['mentor_id' => $mentor->id, 'service_config_id' => $initialService->id, 'is_active' => true, 'sort_order' => 1, 'created_at' => now(), 'updated_at' => now()],
+        ['mentor_id' => $mentor->id, 'service_config_id' => $choiceService->id, 'is_active' => true, 'sort_order' => 2, 'created_at' => now(), 'updated_at' => now()],
+    ]);
+
+    $startsAt = Carbon::parse('2026-05-05 17:00:00', 'America/New_York');
+    $this->travelTo($startsAt->copy()->subHours(18));
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $initialService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $initialService->id,
+        'session_date' => $startsAt->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 1,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'first_booker_id' => $student->id,
+        'first_booked_at' => now(),
+        'service_choice_cutoff_at' => $startsAt->copy()->subHours(12)->utc(),
+        'meeting_link' => 'https://zoom.us/j/service-choice-kept',
+        'external_calendar_event_id' => 'office-choice-zoom',
+        'calendar_provider' => 'zoom',
+        'calendar_sync_status' => 'synced',
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->patchJson(route('student.office-hours.sessions.service', $sessionId), [
+            'service_config_id' => $choiceService->id,
+        ])
+        ->assertOk()
+        ->assertJsonPath('serviceChoice.currentServiceId', $choiceService->id)
+        ->assertJsonPath('serviceChoice.eligible', true);
+
+    $this->assertDatabaseHas('office_hour_sessions', [
+        'id' => $sessionId,
+        'current_service_id' => $choiceService->id,
+        'meeting_link' => 'https://zoom.us/j/service-choice-kept',
+        'external_calendar_event_id' => 'office-choice-zoom',
+    ]);
+});
+
+it('rejects office-hours service choice outside the eligibility rules', function (array $overrides, string $message) {
+    $firstStudent = makeUser('office-choice-first');
+    $firstStudent->assignRole('student');
+    $otherStudent = makeUser('office-choice-other');
+    $otherStudent->assignRole('student');
+    if (($overrides['first_booker_id'] ?? null) === 'other') {
+        $overrides['first_booker_id'] = $otherStudent->id;
+    }
+    $actor = $overrides['actor'] ?? $firstStudent;
+    if ($actor instanceof User) {
+        $actor->assignRole('student');
+    }
+
+    $mentor = makeMentor();
+    $initialService = makeService(['service_name' => 'Tutoring']);
+    $choiceService = makeService(['service_name' => 'Program Insights']);
+    DB::table('mentor_services')->insert([
+        ['mentor_id' => $mentor->id, 'service_config_id' => $initialService->id, 'is_active' => true, 'sort_order' => 1, 'created_at' => now(), 'updated_at' => now()],
+        ['mentor_id' => $mentor->id, 'service_config_id' => $choiceService->id, 'is_active' => true, 'sort_order' => 2, 'created_at' => now(), 'updated_at' => now()],
+    ]);
+
+    $startsAt = Carbon::parse('2026-05-05 17:00:00', 'America/New_York');
+    $this->travelTo($startsAt->copy()->subHours($overrides['hours_before_start'] ?? 18));
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $initialService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $initialService->id,
+        'session_date' => $startsAt->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => $overrides['current_occupancy'] ?? 1,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => $overrides['service_locked'] ?? false,
+        'first_booker_id' => $overrides['first_booker_id'] ?? $firstStudent->id,
+        'first_booked_at' => now(),
+        'service_choice_cutoff_at' => $startsAt->copy()->subHours(12)->utc(),
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($actor)
+        ->patchJson(route('student.office-hours.sessions.service', $sessionId), [
+            'service_config_id' => $choiceService->id,
+        ])
+        ->assertStatus(422)
+        ->assertJsonPath('message', $message);
+})->with([
+    'before window opens' => [['hours_before_start' => 30], 'Service choice opens 24 hours before the session starts.'],
+    'after window closes' => [['hours_before_start' => 10], 'Service choice closed 12 hours before the session starts.'],
+    'locked by second student' => [['current_occupancy' => 2, 'service_locked' => true], 'The office-hours focus is locked because another student has joined.'],
+    'not first student' => [['first_booker_id' => 'other'], 'Only the first student booked for this session can choose the focus.'],
+]);
+
+it('rejects service choices that are not eligible active non-office-hours mentor services', function (array $serviceOverrides) {
+    $student = makeUser('office-choice-invalid-service');
+    $student->assignRole('student');
+    $mentor = makeMentor();
+    $initialService = makeService(['service_name' => 'Tutoring']);
+    $invalidService = makeService($serviceOverrides);
+
+    DB::table('mentor_services')->insert([
+        ['mentor_id' => $mentor->id, 'service_config_id' => $initialService->id, 'is_active' => true, 'sort_order' => 1, 'created_at' => now(), 'updated_at' => now()],
+        ['mentor_id' => $mentor->id, 'service_config_id' => $invalidService->id, 'is_active' => true, 'sort_order' => 2, 'created_at' => now(), 'updated_at' => now()],
+    ]);
+
+    $startsAt = Carbon::parse('2026-05-05 17:00:00', 'America/New_York');
+    $this->travelTo($startsAt->copy()->subHours(18));
+
+    $scheduleId = DB::table('office_hour_schedules')->insertGetId([
+        'mentor_id' => $mentor->id,
+        'current_service_id' => $initialService->id,
+        'day_of_week' => 'tue',
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'frequency' => 'weekly',
+        'max_spots' => 3,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $sessionId = DB::table('office_hour_sessions')->insertGetId([
+        'schedule_id' => $scheduleId,
+        'current_service_id' => $initialService->id,
+        'session_date' => $startsAt->toDateString(),
+        'start_time' => '17:00:00',
+        'timezone' => 'America/New_York',
+        'current_occupancy' => 1,
+        'max_spots' => 3,
+        'is_full' => false,
+        'service_locked' => false,
+        'first_booker_id' => $student->id,
+        'first_booked_at' => now(),
+        'service_choice_cutoff_at' => $startsAt->copy()->subHours(12)->utc(),
+        'status' => 'upcoming',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $this->actingAs($student)
+        ->patchJson(route('student.office-hours.sessions.service', $sessionId), [
+            'service_config_id' => $invalidService->id,
+        ])
+        ->assertStatus(422)
+        ->assertJsonPath('message', 'Choose an active service this mentor offers.');
+})->with([
+    'inactive service' => [['service_name' => 'Inactive Focus', 'is_active' => false]],
+    'office-hours service' => [['service_name' => 'Office Hours', 'service_slug' => 'office_hours_invalid', 'is_office_hours' => true]],
+    'unsupported service' => [['service_name' => 'Application Review']],
+]);

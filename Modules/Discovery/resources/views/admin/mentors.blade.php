@@ -1,0 +1,132 @@
+@extends('discovery::admin.layouts.app')
+
+@php
+  $adminMentorRows = $adminMentorsData['rows'] ?? [];
+  $adminMentorProgramOptions = $adminMentorsData['program_options'] ?? [];
+  $adminMentorStatusOptions = $adminMentorsData['status_options'] ?? [];
+  $formatAdminMoney = static function ($amount): string {
+    if ($amount === null) {
+      return '-';
+    }
+
+    $precision = fmod((float) $amount, 1.0) === 0.0 ? 0 : 2;
+
+    return '$' . number_format((float) $amount, $precision);
+  };
+@endphp
+
+@section('admin_title', 'Mentors')
+@section('admin_heading', 'Admin Mentors')
+@section('admin_subtitle', 'Track mentor performance, service mix, and profile status.')
+
+@section('admin_content')
+  <div class="section-head">
+    <div>
+      <h2>Mentors</h2>
+    </div>
+    <div>
+      <button class="primary-btn" id="openCreateMentorModalBtn" type="button">Add Mentor</button>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <input
+      type="text"
+      id="mentorsSearch"
+      placeholder="Search mentor, school, email..."
+    />
+    <select id="mentorsProgramFilter">
+      <option value="all">All Programs</option>
+      @foreach ($adminMentorProgramOptions as $adminMentorProgramOption)
+        <option value="{{ $adminMentorProgramOption }}">{{ $adminMentorProgramOption }}</option>
+      @endforeach
+    </select>
+    <select id="mentorsStatusFilter">
+      <option value="all">All Statuses</option>
+      @foreach ($adminMentorStatusOptions as $adminMentorStatusOption)
+        <option value="{{ $adminMentorStatusOption }}">{{ $adminMentorStatusOption }}</option>
+      @endforeach
+    </select>
+  </div>
+
+  <div class="table-wrap panel no-pad">
+    <table id="mentorsTable">
+      <thead>
+        <tr>
+          <th>Mentor</th>
+          <th>Program</th>
+          <th>School</th>
+          <th>Total Meetings</th>
+          <th>Total Revenue</th>
+          <th>Free Consult</th>
+          <th>Tutoring</th>
+          <th>Program Insights</th>
+          <th>Interview Prep</th>
+          <th>Application Review</th>
+          <th>Gap Year Planning</th>
+          <th>Missed</th>
+          <th>Refunds</th>
+          <th>Rating</th>
+          <th>Status</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        @foreach ($adminMentorRows as $adminMentor)
+          <tr data-program="{{ $adminMentor['program_filter'] }}" data-status="{{ $adminMentor['status_filter'] }}">
+            <td>
+              <strong>{{ $adminMentor['name'] ?: '-' }}</strong><span>{{ $adminMentor['email'] ?: '-' }}</span>
+            </td>
+            <td>{{ $adminMentor['program'] ?: '-' }}</td>
+            <td>{{ $adminMentor['school'] ?: '-' }}</td>
+            <td><span data-booking-count-cell>{{ $adminMentor['total_meetings'] }}</span></td>
+            <td>{{ $formatAdminMoney($adminMentor['total_revenue']) }}</td>
+            <td>{{ $adminMentor['free_consult'] }}</td>
+            <td>{{ $adminMentor['tutoring'] }}</td>
+            <td>{{ $adminMentor['program_insights'] }}</td>
+            <td>{{ $adminMentor['interview_prep'] }}</td>
+            <td>{{ $adminMentor['application_review'] }}</td>
+            <td>{{ $adminMentor['gap_year_planning'] }}</td>
+            <td>{{ $adminMentor['missed'] }}</td>
+            <td>{{ $adminMentor['refunds'] }}</td>
+            <td>{{ $adminMentor['rating'] ?: '-' }}</td>
+            <td>{{ $adminMentor['status'] ?: '-' }}</td>
+            <td>
+              <div class="admin-bookings-actions">
+                @if (!empty($adminMentor['user_id']))
+                  <a
+                    href="{{ route('admin.impersonate', $adminMentor['user_id']) }}"
+                    class="ghost-btn admin-impersonate-btn"
+                    title="Log in as {{ $adminMentor['name'] ?? $adminMentor['email'] }}"
+                  >
+                    Login As
+                  </a>
+                @endif
+                <button
+                  class="ghost-btn admin-bookings-trigger admin-bookings-trigger--danger"
+                  type="button"
+                  data-entity-type="mentor"
+                  data-entity-id="{{ $adminMentor['id'] }}"
+                  data-entity-label="{{ $adminMentor['name'] ?? $adminMentor['email'] }}"
+                  data-booking-count="{{ $adminMentor['booking_count'] }}"
+                  data-booking-mode="delete"
+                  data-direct-delete-url="{{ route('admin.mentors.destroy', $adminMentor['id']) }}"
+                  data-direct-delete-kind="mentor"
+                >
+                  Delete
+                </button>
+              </div>
+            </td>
+          </tr>
+        @endforeach
+      </tbody>
+    </table>
+  </div>
+
+  @include('discovery::admin.partials.bookings-manager-modal')
+  @include('discovery::admin.partials.create-mentor-modal')
+@endsection
+
+@section('admin_page_data')
+  @include('discovery::admin.partials.bookings-manager-page-data')
+@endsection

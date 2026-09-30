@@ -1,0 +1,444 @@
+@extends('layouts.portal-mentor')
+@section('title', 'Mentor Availability - Grads Paths')
+@section('portal_css_asset', 'assets/css/discovery.css')
+@section('portal_js_asset', 'assets/js/mentor-availability.js')
+@section('portal_active_nav', 'availability')
+
+@section('portal_css')
+  <link rel="stylesheet" href="{{ asset('assets/css/mentor-availability.css') }}?v={{ filemtime(public_path('assets/css/mentor-availability.css')) }}" />
+@endsection
+
+@php
+  $insights = $availabilityInsights ?? [];
+  $initialSchedulerPayload = $schedulerPayload ?? [];
+  $officeHoursConfigData = $officeHoursConfig ?? [];
+  $officeHoursPreviewData = $officeHoursPreview ?? [];
+  $hasOldInput = session()->getOldInput() !== [];
+  $viewErrors = $errors ?? new \Illuminate\Support\ViewErrorBag();
+  $selectedIds = collect(old('service_config_ids', $selectedServiceIds ?? []))
+      ->map(fn ($id) => (int) $id)
+      ->all();
+
+  $initialSchedulerPayload['save_url'] = route('mentor.availability.update');
+  $initialSchedulerPayload['timezone'] = old('timezone', $initialSchedulerPayload['timezone'] ?? ($availabilityData['timezone'] ?? \Modules\Settings\app\Support\TimezoneOptions::fallback()));
+  $initialSchedulerPayload['uses_old_input'] = $hasOldInput;
+  $initialSchedulerPayload['date_slots'] = collect(
+      $hasOldInput ? (json_decode((string) old('date_slots_payload', '[]'), true) ?: []) : ($initialSchedulerPayload['date_slots'] ?? [])
+  )
+      ->filter(fn ($row) => is_array($row) && (!empty($row['date']) || !empty($row['key'])))
+      ->map(function (array $row) {
+          $date = (string) ($row['date'] ?? $row['key'] ?? '');
+          $slots = collect($row['slots'] ?? [])
+              ->filter(fn ($slot) => is_array($slot))
+              ->map(fn ($slot) => [
+                  'slot_id' => isset($slot['slot_id']) ? (int) $slot['slot_id'] : null,
+                  'start_time' => (string) ($slot['start_time'] ?? ''),
+                  'end_time' => (string) ($slot['end_time'] ?? ''),
+                  'service_config_id' => isset($slot['service_config_id']) ? (int) $slot['service_config_id'] : null,
+                  'session_type' => in_array((string) ($slot['session_type'] ?? '1on1'), ['1on1', '1on3', '1on5'], true) ? (string) ($slot['session_type'] ?? '1on1') : '1on1',
+                  'is_booked' => !empty($slot['is_booked']),
+                  'booking_count' => isset($slot['booking_count']) ? (int) $slot['booking_count'] : 0,
+              ])
+              ->values()
+              ->all();
+
+          return [
+              'key' => $date,
+              'label' => \Carbon\Carbon::parse($date)->format('l'),
+              'enabled' => !empty($row['enabled']) || count($slots) > 0,
+              'slot_count' => isset($row['slot_count']) ? (int) $row['slot_count'] : count($slots),
+              'booked_count' => isset($row['booked_count']) ? (int) $row['booked_count'] : 0,
+              'bookings' => collect($row['bookings'] ?? [])
+                  ->filter(fn ($booking) => is_array($booking))
+                  ->values()
+                  ->all(),
+              'slots' => $slots,
+          ];
+      })
+      ->values()
+      ->all();
+  $initialSchedulerPayload['office_hours'] = [
+      'config' => $officeHoursConfigData,
+      'preview' => $officeHoursPreviewData,
+  ];
+    $officeHoursServiceOptions = $officeHoursConfigData['service_options'] ?? $initialSchedulerPayload['service_options'] ?? [];
+  $officeHoursEnabled = filter_var(old('office_hours.enabled', $officeHoursConfigData['enabled'] ?? false), FILTER_VALIDATE_BOOLEAN);
+    $selectedOfficeHoursServiceId = old('office_hours.service_config_id', $officeHoursConfigData['service_config_id'] ?? '');
+    if ($selectedOfficeHoursServiceId === '' && !empty($officeHoursServiceOptions)) {
+      $selectedOfficeHoursServiceId = (string) ($officeHoursServiceOptions[0]['value'] ?? '');
+    }
+  $selectedOfficeHoursDay = old('office_hours.day_of_week', $officeHoursConfigData['day_of_week'] ?? 'sun');
+  $selectedOfficeHoursTime = old('office_hours.start_time', $officeHoursConfigData['start_time'] ?? '20:00');
+  $selectedOfficeHoursFrequency = old('office_hours.frequency', $officeHoursConfigData['frequency'] ?? 'weekly');
+  if ($hasOldInput) {
+      $officeHoursConfigData['enabled'] = $officeHoursEnabled;
+      $officeHoursConfigData['service_config_id'] = $selectedOfficeHoursServiceId !== '' ? (int) $selectedOfficeHoursServiceId : null;
+      $officeHoursConfigData['day_of_week'] = $selectedOfficeHoursDay;
+      $officeHoursConfigData['start_time'] = $selectedOfficeHoursTime;
+      $officeHoursConfigData['frequency'] = $selectedOfficeHoursFrequency;
+      $initialSchedulerPayload['office_hours']['config'] = $officeHoursConfigData;
+  }
+@endphp
+
+@section('portal_content')
+  <main class="availability-main">
+    <header class="availability-page-header">
+      <div class="availability-page-title">Set Your Date-Specific Availability</div>
+      <p class="availability-page-sub">
+        Build your booking schedule date by date. Each slot is tied to one mentor service and only applies to the specific date you add.
+      </p>
+    </header>
+
+    @if ($errors->any())
+      <div class="availability-alert availability-alert--error">
+        <strong>Please review the availability form.</strong>
+        <ul>
+          @foreach ($errors->all() as $error)
+            <li>{{ $error }}</li>
+          @endforeach
+        </ul>
+      </div>
+    @endif
+
+    <div class="availability-alert" id="availabilityAlert" hidden></div>
+
+    <section class="availability-stats">
+      <article class="availability-stat availability-stat--accent">
+        <div class="availability-stat-label">Saved Dates</div>
+        <div class="availability-stat-value" id="availabilityActiveDays">{{ $insights['active_days'] ?? 0 }}</div>
+        <div class="availability-stat-hint">dates currently open</div>
+      </article>
+
+      <article class="availability-stat">
+        <div class="availability-stat-label">Total Hours</div>
+        <div class="availability-stat-value" id="availabilityWeeklyHours">{{ $insights['weekly_hours'] ?? '0 hrs' }}</div>
+        <div class="availability-stat-hint">hours across saved dates</div>
+      </article>
+
+      <article class="availability-stat">
+        <div class="availability-stat-label">Upcoming Slots</div>
+        <div class="availability-stat-value" id="availabilityProjectedSlots">{{ $insights['open_slots_count'] ?? 0 }}</div>
+        <div class="availability-stat-hint">saved upcoming slots on your calendar</div>
+      </article>
+
+      <article class="availability-stat">
+        <div class="availability-stat-label">Next Slot</div>
+        <div class="availability-stat-value availability-stat-value--compact" id="availabilityNextSlot">
+          {{ $insights['next_open_slot'] ?? 'No open slots generated yet' }}
+        </div>
+        <div class="availability-stat-hint">first upcoming block from this schedule</div>
+      </article>
+    </section>
+
+    <form method="POST" action="{{ route('mentor.availability.update') }}" id="mentorAvailabilityForm" novalidate>
+      @csrf
+      @method('PATCH')
+
+      <section class="availability-card availability-card--services">
+        <div class="availability-card-header">
+          <div>
+            <div class="availability-card-title">Services Offered</div>
+            <div class="availability-card-sub">Select the active services students can book, then assign those services to your available slots.</div>
+          </div>
+        </div>
+
+        <input type="hidden" name="service_config_ids_present" value="1" />
+        <div class="availability-services-panel">
+          <div class="availability-service-options">
+            @foreach ($services as $service)
+              @php
+                $allowedSessionTypes = collect([
+                    $service->price_1on1 !== null ? '1on1' : null,
+                    $service->price_1on3_per_person !== null ? '1on3' : null,
+                    $service->price_1on5_per_person !== null ? '1on5' : null,
+                ])->filter()->values()->all();
+                $allowedSessionTypes = $allowedSessionTypes ?: ['1on1'];
+              @endphp
+              <label class="availability-service-option">
+                <input
+                  class="availability-service-option-input"
+                  type="checkbox"
+                  name="service_config_ids[]"
+                  value="{{ $service->id }}"
+                  data-service-label="{{ $service->service_name }}"
+                  data-service-duration="{{ max((int) $service->duration_minutes, 1) }}"
+                  data-service-office-hours="{{ $service->is_office_hours ? 'true' : 'false' }}"
+                  data-service-allowed-sizes='@json($allowedSessionTypes)'
+                  @checked(in_array($service->id, $selectedIds, true))
+                />
+                <span class="availability-service-option-copy">
+                  <strong>{{ $service->service_name }}</strong>
+                  <span>{{ $service->duration_minutes }} min session</span>
+                </span>
+                <span class="availability-service-option-toggle" aria-hidden="true">
+                  <span class="availability-service-option-toggle-thumb"></span>
+                </span>
+              </label>
+            @endforeach
+          </div>
+        </div>
+        <p class="availability-field-error">{{ $viewErrors->first('service_config_ids') ?: $viewErrors->first('service_config_ids.*') }}</p>
+      </section>
+
+      <section class="availability-card availability-card--office-hours">
+        <div class="availability-card-header availability-card-header--office-hours">
+          <div>
+            <div class="availability-card-title">Office Hours for This Mentor</div>
+            <div class="availability-card-sub">
+              Configure one recurring office-hours series for this mentor and preview how the next session will appear to students.
+            </div>
+          </div>
+          <span class="availability-badge availability-badge--office-hours" id="officeHoursSpotsBadge">
+            {{ $officeHoursPreviewData['spots_badge'] ?? '0/3 spots filled' }}
+          </span>
+        </div>
+
+        <div class="availability-office-hours-shell">
+          <div class="availability-office-hours-config">
+            <div class="availability-office-hours-toggle">
+              <input type="hidden" name="office_hours[enabled]" value="0" />
+              <label class="availability-switch" for="officeHoursEnabled">
+                <input
+                  type="checkbox"
+                  id="officeHoursEnabled"
+                  name="office_hours[enabled]"
+                  value="1"
+                  @checked($officeHoursEnabled)
+                />
+                <span class="availability-switch-ui" aria-hidden="true"></span>
+                <span class="availability-switch-copy">
+                  <strong>Enable recurring office hours</strong>
+                  <span>Students book these sessions with 1 credit at a recurring weekly time.</span>
+                </span>
+              </label>
+            </div>
+
+            <div class="availability-office-hours-fields" id="officeHoursFields">
+              <div class="availability-field">
+                <label for="officeHoursService">This Week&rsquo;s Focus</label>
+                <select id="officeHoursService" name="office_hours[service_config_id]">
+                  <option value="">Select service</option>
+                  @foreach ($officeHoursServiceOptions as $option)
+                    <option value="{{ $option['value'] }}" @selected((string) $selectedOfficeHoursServiceId === (string) $option['value'])>
+                      {{ $option['label'] }}
+                    </option>
+                  @endforeach
+                </select>
+                <p class="availability-field-error" id="officeHoursServiceError">{{ $errors->first('office_hours.service_config_id') }}</p>
+              </div>
+
+              <div class="availability-field">
+                <label for="officeHoursDay">Recurring Day</label>
+                <select id="officeHoursDay" name="office_hours[day_of_week]">
+                  @foreach ($officeHoursConfigData['weekday_options'] ?? [] as $option)
+                    <option value="{{ $option['value'] }}" @selected($selectedOfficeHoursDay === $option['value'])>
+                      {{ $option['label'] }}
+                    </option>
+                  @endforeach
+                </select>
+                <p class="availability-field-error" id="officeHoursDayError">{{ $errors->first('office_hours.day_of_week') }}</p>
+              </div>
+
+              <div class="availability-field">
+                <label for="officeHoursTimeTrigger">Start Time</label>
+                <button class="time-trigger" type="button" id="officeHoursTimeTrigger">
+                  <i class="ti ti-clock" aria-hidden="true"></i>
+                  <span id="officeHoursTimeDisplay">Select Time</span>
+                  <i class="ti ti-chevron-down" aria-hidden="true"></i>
+                </button>
+                <input type="hidden" id="officeHoursTime" name="office_hours[start_time]" value="{{ $selectedOfficeHoursTime }}" />
+                <p class="availability-field-error" id="officeHoursTimeError">{{ $errors->first('office_hours.start_time') }}</p>
+              </div>
+
+              <div class="availability-field">
+                <input type="hidden" id="officeHoursFrequency" name="office_hours[frequency]" value="weekly" />
+                <label>Frequency</label>
+                <div class="availability-fixed-field">Weekly</div>
+                <p class="availability-field-error" id="officeHoursFrequencyError">{{ $errors->first('office_hours.frequency') }}</p>
+              </div>
+
+              <div class="availability-office-hours-fixed">
+                <div class="availability-office-hours-fixed-label">Capacity</div>
+                <div class="availability-office-hours-fixed-value">3 spots</div>
+                <p>Meeting type stays fixed as small-group office hours.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="availability-card">
+        <div class="availability-card-header">
+          <div>
+            <div class="availability-card-title">Schedule Settings</div>
+            <div class="availability-card-sub">Timezone for the date-specific schedule below</div>
+          </div>
+        </div>
+
+        <div class="availability-settings-grid">
+          <div class="availability-field">
+            <label for="availabilityTimezone">Timezone</label>
+            <select id="availabilityTimezone" name="timezone">
+              @foreach ($timezoneOptions as $value => $label)
+                <option value="{{ $value }}" @selected(old('timezone', $availabilityData['timezone'] ?? \Modules\Settings\app\Support\TimezoneOptions::fallback()) === $value)>
+                  {{ $label }} ({{ $value }})
+                </option>
+              @endforeach
+            </select>
+            <p class="availability-timezone-hint" id="availabilityTimezoneHint">
+              We use this timezone when saving your availability. Students see these slots converted to their own timezone.
+            </p>
+            <button class="availability-timezone-detected-btn" id="availabilityUseDetectedTimezone" type="button" hidden>
+              Use detected timezone
+            </button>
+          </div>
+
+        </div>
+
+        <div class="availability-settings-note" id="availabilityRangeNote">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="12" y1="8" x2="12" y2="12"></line>
+            <line x1="12" y1="16" x2="12.01" y2="16"></line>
+          </svg>
+          <span id="availabilityRangeSummary">{{ $insights['effective_range'] ?? 'Dates stay active until you remove them' }}</span>
+        </div>
+      </section>
+
+      <section class="availability-card availability-card--scheduler">
+        <div class="availability-card-header">
+          <div>
+            <div class="availability-card-title">Availability Scheduler</div>
+            <div class="availability-card-sub">Use the calendar to click a future day and edit only that date's service-specific slots from the day panel.</div>
+          </div>
+          <span class="availability-badge" id="availabilityActiveBadge">
+            {{ ($insights['active_days'] ?? 0) . ' active day' . (($insights['active_days'] ?? 0) === 1 ? '' : 's') }}
+          </span>
+        </div>
+
+        <div class="availability-scheduler-toolbar">
+          <p class="availability-toolbar-copy">
+            Past days appear completed and locked. Clicking a future date edits only that date's service-specific slots.
+          </p>
+          <div class="availability-draft-state" id="availabilityDraftState">All changes saved</div>
+        </div>
+
+        <div class="availability-scheduler-shell">
+          <div class="availability-month-shell">
+            <section class="availability-month-card">
+              <div class="availability-month-toolbar">
+                <div class="availability-month-view-pill">
+                  <button type="button" class="availability-month-view-btn" data-view="day">Day</button>
+                  <button type="button" class="availability-month-view-btn is-active" data-view="week">Week</button>
+                  {{-- <button type="button" class="availability-month-view-btn" data-view="month">Month</button> --}}
+                  {{-- <button type="button" class="availability-month-view-btn" data-view="year">Year</button> --}}
+                </div>
+
+                <div class="availability-month-nav">
+                  <button type="button" class="availability-month-today-btn" id="availabilityTodayBtn">Today</button>
+                  <button type="button" class="availability-month-arrow" id="availabilityPrevMonthBtn" aria-label="Previous month">&lsaquo;</button>
+                  <button type="button" class="availability-month-arrow" id="availabilityNextMonthBtn" aria-label="Next month">&rsaquo;</button>
+                </div>
+              </div>
+
+              <div class="availability-month-heading">
+                <h3 id="availabilityMonthLabel">Month</h3>
+                <p id="availabilityMonthMeta">Click a future day to edit that date's service-specific slots.</p>
+              </div>
+
+              <div class="availability-month-grid" id="availabilityMonthGrid" aria-label="Date-specific availability calendar"></div>
+
+              <section class="availability-bookings-panel" id="availabilityBookingsPanel">
+                <div class="availability-bookings-head">
+                  <div>
+                    <div class="availability-bookings-kicker">Bookings</div>
+                    <h4 id="availabilityBookingsTitle">Bookings for selected date</h4>
+                    <p id="availabilityBookingsSubtitle">Click a date to review who booked, what service they chose, and which slot is reserved.</p>
+                  </div>
+                  <span class="availability-bookings-count" id="availabilityBookingsCount">0 booked</span>
+                </div>
+
+                <div class="availability-bookings-empty" id="availabilityBookingsEmpty">
+                  No bookings for this date yet.
+                </div>
+
+                <div class="availability-bookings-list" id="availabilityBookingsList"></div>
+              </section>
+            </section>
+
+            <aside class="availability-day-panel" id="availabilityDayPanel">
+              <div class="availability-day-panel-head">
+                <div>
+                  <div class="availability-day-panel-kicker">Date Availability</div>
+                  <h3 id="availabilityDayPanelTitle">Select a future day</h3>
+                  <p id="availabilityDayPanelSubtitle">Choose a date from the calendar to edit that date's slots and services.</p>
+                </div>
+                <span class="availability-day-status" id="availabilityDayStatus">No slots</span>
+              </div>
+
+              <div class="availability-day-panel-note" id="availabilityDayPanelNote">
+                Each time block below belongs to one mentor service and only updates the selected date.
+              </div>
+
+              <div class="availability-day-panel-actions">
+                <button type="button" class="availability-secondary-btn" id="availabilityAddSlotBtn">Add Slot</button>
+                <button type="button" class="availability-ghost-btn" id="availabilityClearDayBtn">Clear Day</button>
+              </div>
+
+              <div class="availability-day-panel-empty" id="availabilityDayEmptyState">
+                This date is currently unavailable. Add a slot to make it active.
+              </div>
+
+              <div class="availability-day-slot-list" id="availabilityDaySlotList"></div>
+
+              <p class="availability-day-error" id="availabilityDayError"></p>
+            </aside>
+          </div>
+        </div>
+
+        <div id="availabilityHiddenState" hidden></div>
+
+        <div class="availability-card-footer">
+          <span class="availability-footer-note">
+            Save applies these date-specific service slots to future unbooked availability for the selected meeting size.
+          </span>
+          <button class="availability-save-btn" id="availabilitySaveBtn" type="submit">Save Availability</button>
+        </div>
+      </section>
+    </form>
+  </main>
+
+  <script id="mentorAvailabilityPayload" type="application/json">@json($initialSchedulerPayload)</script>
+  
+  <div class="picker-overlay" id="picker-overlay">
+    <div class="picker-popup" id="picker-popup">
+      <div class="picker-header">
+        <span id="picker-label">Start time</span>
+        <button type="button" id="picker-close-btn" aria-label="Close">×</button>
+      </div>
+      <div class="col-labels">
+        <div class="col-label">Hour</div>
+        <div class="col-label">Min</div>
+        <div class="col-label">AM/PM</div>
+      </div>
+      <div class="picker-columns">
+        <div class="scroll-col" id="hour-col">
+          <div class="scroll-highlight"></div>
+        </div>
+        <div class="scroll-col" id="min-col">
+          <div class="scroll-highlight"></div>
+        </div>
+        <div class="ampm-col" id="ampm-col">
+          <button type="button" class="ampm-btn" id="am-btn">AM</button>
+          <button type="button" class="ampm-btn" id="pm-btn">PM</button>
+        </div>
+      </div>
+      <div class="picker-footer">
+        <button type="button" class="btn-cancel" id="picker-cancel-btn">Cancel</button>
+        <button type="button" class="btn-apply" id="picker-apply-btn">Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="availability-toast" id="availabilityToast"></div>
+@endsection

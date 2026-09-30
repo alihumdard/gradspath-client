@@ -1,0 +1,21 @@
+<?php
+
+use Illuminate\Support\Facades\Route;
+use Modules\OfficeHours\app\Http\Controllers\Mentor\OfficeHoursController as MentorOfficeHoursController;
+use Modules\OfficeHours\app\Http\Controllers\Student\OfficeHourSessionServiceController;
+use Modules\OfficeHours\app\Http\Controllers\Student\OfficeHoursController as StudentOfficeHoursController;
+
+/*
+|--------------------------------------------------------------------------
+| OfficeHours Module — Web Routes
+|--------------------------------------------------------------------------
+*/
+
+Route::middleware(['web', 'auth', 'active', 'role:student', 'feedback.required'])->group(function () {
+    Route::get('/student/office-hours', [StudentOfficeHoursController::class, 'index'])->name('student.office-hours');
+    Route::patch('/student/office-hours/sessions/{session}/service', [OfficeHourSessionServiceController::class, 'update'])->name('student.office-hours.sessions.service');
+});
+
+Route::middleware(['web', 'auth', 'active', 'role:mentor', 'mentor.approved', 'mentor.notes.required'])->group(function () {
+    Route::get('/mentor/office-hours', [MentorOfficeHoursController::class, 'index'])->name('mentor.office-hours');
+});
